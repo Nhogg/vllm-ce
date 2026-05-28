@@ -153,6 +153,14 @@ class KVCacheBlock:
         )
 
 
+"""
+NATHAN_NOTE
+Doubly linked list of free blocks built by mutating KVCacheBlock.prev_free_block
+and next_free_block directly rather than allocating list nodes.
+Uses fake head / tail sentinels to simplify edge cases.
+"""
+
+
 class FreeKVCacheBlockQueue:
     """This class organizes a list of KVCacheBlock objects to a doubly linked
     list of free blocks. We implement this class instead of using Python
@@ -204,6 +212,13 @@ class FreeKVCacheBlockQueue:
             # For empty list, simply connect the fake head and tail.
             self.fake_free_list_head.next_free_block = self.fake_free_list_tail
             self.fake_free_list_tail.prev_free_block = self.fake_free_list_head
+
+
+"""
+NATHAN_NOTE
+Takes the oldest free blocks from the front of the queue.
+"""
+
 
     def popleft(self) -> KVCacheBlock:
         """Pop the first free block and reduce num_free_blocks by 1.
@@ -275,6 +290,13 @@ class FreeKVCacheBlockQueue:
             curr_block.prev_free_block = self.fake_free_list_head
         return ret
 
+
+"""
+NOTE
+Unlinks a block from the middle in O(1) time without iterating thru
+queue. Caller's responsibility to ensure block is in free list.
+"""
+
     def remove(self, block: KVCacheBlock) -> None:
         """Remove a block in the free list and reduce num_free_blocks by 1.
 
@@ -294,6 +316,13 @@ class FreeKVCacheBlockQueue:
         # Remove the block from the linked list.
         block.prev_free_block = block.next_free_block = None
         self.num_free_blocks -= 1
+
+
+"""
+NATHAN_NOTE
+Puts newly freed blocks at the tail of the DLL
+"""
+
 
     def append(self, block: KVCacheBlock) -> None:
         """Put a block back into the free list and increase
