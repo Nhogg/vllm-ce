@@ -2003,3 +2003,241 @@ def test_block_lookup_cache_multi_blocks_per_key():
     assert cache.pop(key1, 11) is block11
     assert cache.get_one_block(key1) is None
     assert cache.pop(key1, 12) is None
+
+
+def test_can_fit_full_sequence_swa_cap_admits_long_prompt():
+    """Hybrid full+SWA model with a pool sized at the startup minimum should
+    admit a prompt longer than the SWA cap, because SlidingWindowManager
+    recycles blocks during chunked prefill (issue #39734)."""
+    block_size = 16
+    sliding_window = 4 * block_size  # 64 tokens
+    max_num_batched_tokens = 8 * block_size  # 128 tokens
+    max_model_len = 64 * block_size  # 1024 tokens — much larger than the SWA cap
+    # Startup pool sizing: full demands cdiv(max_model_len, bs) = 64 blocks,
+    # SWA demands cdiv(SW-1+max_batched, bs) + 1 = cdiv(191, 16) + 1 = 13.
+    # Pool minimum = 64 + 13 = 77; +1 for the null block.
+    num_blocks = 64 + 13 + 1
+
+    config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer_full"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["layer_swa"],
+                SlidingWindowSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=sliding_window,
+                ),
+            ),
+        ],
+    )
+
+    manager = KVCacheManager(
+        config,
+        max_model_len=max_model_len,
+        max_num_batched_tokens=max_num_batched_tokens,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+
+    # A prompt that is shorter than max_model_len but longer than SW + chunk:
+    # cdiv(prompt_len, bs) = 32 blocks. Without the cap, admission would
+    # demand 32 (full) + 32 (SWA) = 64 blocks. With the cap, SWA contributes
+    # only 13, so total = 32 + 13 = 45 ≤ pool size.
+    prompt_len = 32 * block_size
+    req = make_request("long", list(range(prompt_len)), block_size, sha256)
+
+    assert (
+        manager.allocate_slots(req, block_size, full_sequence_must_fit=True) is not None
+    )
+
+
+def test_can_fit_full_sequence_full_attention_still_gates_oversized():
+    """The cap only loosens the SWA group; a prompt that exceeds the
+    full-attention pool capacity must still be rejected."""
+    block_size = 16
+    sliding_window = 4 * block_size
+    max_num_batched_tokens = 8 * block_size
+    max_model_len = 64 * block_size
+    # Provide a tiny pool — even a small prompt should be rejected.
+    num_blocks = 5
+
+    config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer_full"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["layer_swa"],
+                SlidingWindowSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=sliding_window,
+                ),
+            ),
+        ],
+    )
+
+    manager = KVCacheManager(
+        config,
+        max_model_len=max_model_len,
+        max_num_batched_tokens=max_num_batched_tokens,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+
+    # 16 blocks of full attention demand alone exceeds the 5-block pool.
+    prompt_len = 16 * block_size
+    req = make_request("oversized", list(range(prompt_len)), block_size, sha256)
+
+    assert manager.allocate_slots(req, block_size, full_sequence_must_fit=True) is None
+
+
+# ---------------------------------------------------------------------------
+# Eviction policy tests
+# ---------------------------------------------------------------------------
+
+def _make_manager(eviction_policy: str, num_blocks: int = 7) -> KVCacheManager:
+    block_size = 16
+    return KVCacheManager(
+        make_kv_cache_config(block_size, num_blocks),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+        eviction_policy=eviction_policy,
+    )
+
+
+def _alloc(manager: KVCacheManager, req_id: str, tokens: list[int]) -> None:
+    block_size = 16
+    req = make_request(req_id, tokens, block_size, sha256)
+    computed, num_computed = manager.get_computed_blocks(req)
+    manager.allocate_slots(req, len(tokens), num_computed, computed)
+    return req
+
+
+def test_eviction_policy_lru_evicts_least_recently_used():
+    """LRU must preserve the most recently freed blocks under cache pressure.
+
+    get_computed_blocks caps the cache-hit search at num_tokens-1, so each
+    sequence needs a partial token beyond its 2 full blocks so that the lookup
+    can see both full blocks (max_num_blocks = (num_tokens-1)//block_size = 2).
+    """
+    block_size = 16
+    # 2 full blocks + 1 partial per request → 3 blocks each.
+    # A + B = 6 blocks; +1 null = 7 total.
+    manager = _make_manager("lru", num_blocks=7)
+
+    tokens_A = list(range(2 * block_size + 1))                    # 33 tokens
+    tokens_B = list(range(2 * block_size + 1, 4 * block_size + 2))  # 33 tokens
+
+    req_a = _alloc(manager, "a", tokens_A)
+    req_b = _alloc(manager, "b", tokens_B)
+
+    # Free A first → A's blocks become LRU (front of free queue).
+    manager.free(req_a)
+    # Free B second → B's blocks become MRU (back of free queue).
+    manager.free(req_b)
+
+    # Allocate C (3 blocks) → evicts the 3 LRU blocks = A's blocks.
+    tokens_C = list(range(4 * block_size + 2, 6 * block_size + 3))
+    _alloc(manager, "c", tokens_C)
+
+    # A's full blocks should be evicted — 0 computed tokens.
+    req_a2 = make_request("a2", tokens_A, block_size, sha256)
+    _, num_computed_a = manager.get_computed_blocks(req_a2)
+    assert num_computed_a == 0, "LRU: A's blocks (LRU) should have been evicted"
+
+    # B's 2 full blocks should still be cached — 2 * block_size computed tokens.
+    req_b2 = make_request("b2", tokens_B, block_size, sha256)
+    _, num_computed_b = manager.get_computed_blocks(req_b2)
+    assert num_computed_b == 2 * block_size, (
+        f"LRU: B's blocks (MRU) should still be cached, got {num_computed_b}"
+    )
+
+
+def test_eviction_policy_random_differs_from_lru():
+    """Random eviction should not always choose the LRU block."""
+    import random as stdlib_random
+
+    block_size = 16
+    # 6 usable blocks + 1 null
+    num_usable = 6
+
+    # We'll free blocks in order block_0 .. block_5 (block_0 = LRU, block_5 = MRU).
+    # Evict 1 block. LRU always picks block_0. Random picks uniformly.
+    # Over enough seeds, random should pick a non-LRU block at least once.
+
+    lru_victim_ids: set[int] = set()
+    random_victim_ids: set[int] = set()
+
+    token_groups = [
+        list(range(i * block_size, (i + 1) * block_size + 1))
+        for i in range(num_usable)
+    ]  # each group produces exactly 1 full block
+
+    def run_once(policy: str, seed: int) -> int:
+        stdlib_random.seed(seed)
+        manager = _make_manager(policy, num_blocks=num_usable + 1)
+        reqs = []
+        for i, tokens in enumerate(token_groups):
+            reqs.append(_alloc(manager, str(i), tokens))
+        # Free in order → block_0 freed first = LRU, block_5 freed last = MRU
+        for req in reqs:
+            manager.free(req)
+
+        # Record which block_ids are cached before eviction
+        cached_before = {
+            b.block_id
+            for b in manager.block_pool.free_block_queue.get_all_free_blocks()
+            if b.block_hash is not None
+        }
+
+        # Allocate 1 new block → forces 1 eviction
+        new_tokens = list(range(num_usable * block_size, num_usable * block_size + block_size + 1))
+        _alloc(manager, "new", new_tokens)
+
+        cached_after = {
+            b.block_id
+            for b in manager.block_pool.free_block_queue.get_all_free_blocks()
+            if b.block_hash is not None
+        }
+        evicted = cached_before - cached_after
+        return next(iter(evicted)) if evicted else -1
+
+    for seed in range(30):
+        lru_victim_ids.add(run_once("lru", seed))
+        random_victim_ids.add(run_once("random", seed))
+
+    # LRU should always evict the same block (deterministic).
+    assert len(lru_victim_ids) == 1, (
+        f"LRU should always evict the same block, got {lru_victim_ids}"
+    )
+
+    # Random should evict different blocks across seeds.
+    assert len(random_victim_ids) > 1, (
+        "Random policy should evict different blocks across seeds, "
+        f"but always evicted {random_victim_ids}"
+    )

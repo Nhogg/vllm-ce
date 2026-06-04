@@ -559,6 +559,14 @@ class EngineArgs:
     mamba_block_size: int | None = get_field(CacheConfig, "mamba_block_size")
     mamba_cache_mode: MambaCacheMode = CacheConfig.mamba_cache_mode
 
+    eviction_policy: str = CacheConfig.eviction_policy
+
+    mamba_backend: MambaBackendEnum = MambaBackendEnum.TRITON
+    enable_mamba_cache_stochastic_rounding: bool = (
+        MambaConfig.enable_stochastic_rounding
+    )
+    mamba_cache_philox_rounds: int = MambaConfig.stochastic_rounding_philox_rounds
+
     additional_config: dict[str, Any] = get_field(VllmConfig, "additional_config")
 
     use_tqdm_on_load: bool = LoadConfig.use_tqdm_on_load
@@ -922,6 +930,7 @@ class EngineArgs:
                 "default": None,
             },
         )
+        cache_group.add_argument("--eviction-policy", **cache_kwargs["eviction_policy"])
         cache_group.add_argument(
             "--prefix-caching-hash-algo", **cache_kwargs["prefix_caching_hash_algo"]
         )
@@ -1422,6 +1431,7 @@ class EngineArgs:
             mamba_ssm_cache_dtype=self.mamba_ssm_cache_dtype,
             mamba_block_size=self.mamba_block_size,
             mamba_cache_mode=self.mamba_cache_mode,
+            eviction_policy=self.eviction_policy,
             kv_offloading_size=self.kv_offloading_size,
             kv_offloading_backend=self.kv_offloading_backend,
         )
