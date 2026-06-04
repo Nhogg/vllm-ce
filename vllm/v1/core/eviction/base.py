@@ -7,7 +7,7 @@ class EvictionPolicy(ABC):
     """Selects which free block to evict next.
 
     The policy owns only the selection decision.
-    The block pool retains ownershipof ref-counting,
+    The block pool retains ownership of ref-counting,
     hash maps, and list membership.
     """
 
@@ -17,3 +17,4 @@ class EvictionPolicy(ABC):
 
         The returned block must be removed from free_block_queue by this call.
         """
+        ...
