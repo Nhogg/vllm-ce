@@ -32,6 +32,7 @@ import dataclasses
 import json
 import random
 import time
+from statistics import mean, quantiles
 
 from transformers import PreTrainedTokenizerBase
 
@@ -159,6 +160,48 @@ def repeat_and_sort_requests(
     return [req.prompt for req in repeated_requests]
 
 
+def collect_cache_hit_rate(llm) -> float | None:
+    """Extract prefix cache hit rate from the engine's stats, if available."""
+    try:
+        engine = llm.llm_engine
+        if hasattr(engine, "stat_loggers"):
+            for logger in engine.stat_loggers.values():
+                stats = getattr(logger, "_last_stats", None)
+                if stats and hasattr(stats, "cache_config"):
+                    return None
+        return None
+    except Exception:
+        return None
+
+
+def run_requests_individually(llm, prompts, sampling_params):
+    """Send each prompt one at a time, return list of (e2e_ms, output_tokens)."""
+    results = []
+    for prompt in prompts:
+        t0 = time.perf_counter()
+        outputs = llm.generate([prompt], sampling_params=sampling_params)
+        t1 = time.perf_counter()
+        elapsed_ms = (t1 - t0) * 1000
+        num_output = sum(len(o.outputs[0].token_ids) for o in outputs)
+        results.append((elapsed_ms, num_output))
+    return results
+
+
+def compute_stats(latencies_ms: list[float]) -> dict:
+    if not latencies_ms:
+        return {}
+    qs = quantiles(latencies_ms, n=100)
+    return {
+        "mean_ms": mean(latencies_ms),
+        "p50_ms": qs[49],
+        "p95_ms": qs[94],
+        "p99_ms": qs[98],
+        "min_ms": min(latencies_ms),
+        "max_ms": max(latencies_ms),
+        "n": len(latencies_ms),
+    }
+
+
 def main(args):
     tokenizer = get_tokenizer(args.model, trust_remote_code=True)
     input_length_range = tuple(map(int, args.input_length_range.split(":")))
@@ -186,16 +229,12 @@ def main(args):
             prefix_len=args.prefix_len,
         )
 
-    # Print some helpful stats of the requests.
-    print(f"Sampled {len(filtered_requests)} requests.")
     prompt_lens = [req.prompt_len for req in filtered_requests]
-    print(f"Average input length: {sum(prompt_lens) / len(prompt_lens)}")
-    print(f"P50 input length: {sorted(prompt_lens)[len(prompt_lens) // 2]}")
-    print(f"Min Prompt Length: {min(prompt_lens)}")
-    print(f"Max Prompt Length: {max(prompt_lens)}")
+    print(f"Sampled {len(filtered_requests)} requests.")
+    print(f"  avg input len: {sum(prompt_lens)/len(prompt_lens):.0f}")
+    print(f"  P50 input len: {sorted(prompt_lens)[len(prompt_lens)//2]}")
 
     engine_args = EngineArgs.from_cli_args(args)
-
     llm = LLM.from_engine_args(engine_args)
 
     sampling_params = SamplingParams(
@@ -204,17 +243,63 @@ def main(args):
         detokenize=not args.disable_detokenize,
     )
 
-    print("Testing filtered requests")
-    prompts = repeat_and_sort_requests(
+    # Warm-up: send all prompts once to fill the cache (not measured).
+    if args.warmup_rounds > 0:
+        print(f"Warming up ({args.warmup_rounds} round(s))...")
+        warmup_prompts = repeat_and_sort_requests(
+            filtered_requests, repeat_count=args.warmup_rounds, sort=args.sort
+        )
+        llm.generate(warmup_prompts, sampling_params=sampling_params)
+        print("Warm-up done.")
+
+    # Measurement phase: send one request at a time to get per-request timing.
+    measure_prompts = repeat_and_sort_requests(
         filtered_requests, repeat_count=args.repeat_count, sort=args.sort
     )
 
-    print("------start generating------")
-    test_prefix(
-        llm=llm,
-        prompts=prompts,
-        sampling_params=sampling_params,
+    print(f"Measuring {len(measure_prompts)} requests one-by-one...")
+    t_batch_start = time.perf_counter()
+    per_request = run_requests_individually(llm, measure_prompts, sampling_params)
+    t_batch_end = time.perf_counter()
+
+    latencies_ms = [r[0] for r in per_request]
+    total_output_tokens = sum(r[1] for r in per_request)
+    total_input_tokens = sum(
+        len(tokenizer(p).input_ids) for p in measure_prompts
     )
+    wall_time_s = t_batch_end - t_batch_start
+    throughput_tok_s = (total_input_tokens + total_output_tokens) / wall_time_s
+
+    stats = compute_stats(latencies_ms)
+
+    print("\n=== Results ===")
+    print(f"  Eviction policy   : {args.eviction_policy}")
+    print(f"  Requests measured : {stats['n']}")
+    print(f"  E2E latency P50   : {stats['p50_ms']:.1f} ms")
+    print(f"  E2E latency P95   : {stats['p95_ms']:.1f} ms")
+    print(f"  E2E latency P99   : {stats['p99_ms']:.1f} ms")
+    print(f"  E2E latency mean  : {stats['mean_ms']:.1f} ms")
+    print(f"  Throughput        : {throughput_tok_s:.1f} tok/s")
+
+    if args.output_json:
+        result = {
+            "eviction_policy": args.eviction_policy,
+            "model": args.model,
+            "num_prompts": args.num_prompts,
+            "repeat_count": args.repeat_count,
+            "warmup_rounds": args.warmup_rounds,
+            "output_len": args.output_len,
+            "prefix_len": args.prefix_len,
+            "latency_stats": stats,
+            "throughput_tok_s": throughput_tok_s,
+            "total_output_tokens": total_output_tokens,
+            "total_input_tokens": total_input_tokens,
+            "wall_time_s": wall_time_s,
+            "per_request_latency_ms": latencies_ms,
+        }
+        with open(args.output_json, "w") as f:
+            json.dump(result, f, indent=2)
+        print(f"  Results saved to  : {args.output_json}")
 
 
 def create_argument_parser():
@@ -264,6 +349,18 @@ def create_argument_parser():
             "Do not detokenize responses (i.e. do not include "
             "detokenization time in the latency measurement)"
         ),
+    )
+    parser.add_argument(
+        "--warmup-rounds",
+        type=int,
+        default=1,
+        help="Number of warm-up rounds before measurement (fills the cache).",
+    )
+    parser.add_argument(
+        "--output-json",
+        type=str,
+        default=None,
+        help="Path to write JSON results file.",
     )
 
     parser = EngineArgs.add_cli_args(parser)
