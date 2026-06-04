@@ -11,5 +11,6 @@ class RandomEvictionPolicy(EvictionPolicy):
         block = free_block_queue.fake_free_list_head.next_free_block
         for _ in range(target):
             block = block.next_free_block
+        assert block is not None
         free_block_queue.remove(block)
         return block
