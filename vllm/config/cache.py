@@ -77,6 +77,8 @@ class CacheConfig:
     `ModelConfig` and that value should be manually duplicated here."""
     enable_prefix_caching: bool = True
     """Whether to enable prefix caching."""
+    eviction_policy: str = "lru"
+    """KV cache eviction policy when prefix caching is enabled"""
     prefix_caching_hash_algo: PrefixCachingHashAlgo = "sha256"
     """Set the hash algorithm for prefix caching:\n
     - "sha256" uses Pickle for object serialization before hashing. This is the
