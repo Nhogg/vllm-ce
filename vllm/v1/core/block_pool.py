@@ -11,6 +11,8 @@ from vllm.distributed.kv_events import (
     KVCacheEvent,
 )
 from vllm.logger import init_logger
+from vllm.v1.core.eviction.base import EvictionPolicy
+from vllm.v1.core.eviction.lru import LRUEvictionPolicy
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -151,6 +153,7 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        eviction_policy: EvictionPolicy | None = None,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
@@ -176,6 +179,7 @@ class BlockPool:
 
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue: list[KVCacheEvent] = []
+        self.eviction_policy = eviction_policy or LRUEvictionPolicy()
 
         self.metrics_collector = metrics_collector
 
@@ -311,7 +315,10 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        ret: list[KVCacheBlock] = [
+            self.eviction_policy.select_victim(self.free_block_queue)
+            for _ in range(num_blocks)
+        ]
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
