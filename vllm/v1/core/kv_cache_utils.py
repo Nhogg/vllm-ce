@@ -214,10 +214,10 @@ class FreeKVCacheBlockQueue:
             self.fake_free_list_tail.prev_free_block = self.fake_free_list_head
 
 
-"""
-NATHAN_NOTE
-Takes the oldest free blocks from the front of the queue.
-"""
+    """
+    NATHAN_NOTE
+    Takes the oldest free blocks from the front of the queue.
+    """
 
 
     def popleft(self) -> KVCacheBlock:
@@ -291,11 +291,11 @@ Takes the oldest free blocks from the front of the queue.
         return ret
 
 
-"""
-NOTE
-Unlinks a block from the middle in O(1) time without iterating thru
-queue. Caller's responsibility to ensure block is in free list.
-"""
+    """
+    NOTE
+    Unlinks a block from the middle in O(1) time without iterating thru
+    queue. Caller's responsibility to ensure block is in free list.
+    """
 
     def remove(self, block: KVCacheBlock) -> None:
         """Remove a block in the free list and reduce num_free_blocks by 1.
@@ -318,10 +318,10 @@ queue. Caller's responsibility to ensure block is in free list.
         self.num_free_blocks -= 1
 
 
-"""
-NATHAN_NOTE
-Puts newly freed blocks at the tail of the DLL
-"""
+    """
+    NATHAN_NOTE
+    Puts newly freed blocks at the tail of the DLL
+    """
 
 
     def append(self, block: KVCacheBlock) -> None:
