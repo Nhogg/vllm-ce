@@ -172,6 +172,7 @@ class BlockPool:
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
+        self.eviction_policy.on_block_cached(blk)
 
         # To represent a placeholder block with block_id=0.
         # The ref_cnt of null_block is not maintained, needs special care to
@@ -395,6 +396,7 @@ class BlockPool:
             return False
 
         block.reset_hash()
+        self.eviction_policy.on_block_evicted(block)
 
         if self.enable_kv_cache_events:
             self.kv_event_queue.append(
@@ -420,6 +422,7 @@ class BlockPool:
             if block.ref_cnt == 0 and not block.is_null:
                 self.free_block_queue.remove(block)
             block.ref_cnt += 1
+            self.eviction_policy.on_block_cached(block_hash_with_group_id, blk)
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
 
@@ -438,6 +441,13 @@ class BlockPool:
         self.free_block_queue.append_n(
             [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
         )
+
+        freed_blocks = [
+                block for block blocks_list if block.ref_cnt == 0 and not block.is_null
+                ]
+        self.free_block_queue.append(freed_blocks)
+        for block in freed_blocks:
+            self.eviction_policy.on_block_freed(block)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
@@ -474,6 +484,7 @@ class BlockPool:
                 "blocks (%d) are not freed yet",
                 num_used_blocks - 1,
             )
+            self.eviction_policy.on_reset()
             return False
 
         # Remove all hashes so that no new blocks will hit.
