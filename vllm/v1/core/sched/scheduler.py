@@ -235,10 +235,8 @@ class Scheduler(SchedulerInterface):
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
             eviction_policy=self.cache_config.eviction_policy,
-            enable_paged_eviction=(
-                self.cache_config.active_kv_eviction_policy == "paged"
-            ),
-            paged_eviction_cache_budget_tokens=(
+            active_kv_eviction_policy=self.cache_config.active_kv_eviction_policy,
+            active_kv_eviction_cache_budget_tokens=(
                 self.cache_config.active_kv_eviction_cache_budget_tokens
             ),
         )
@@ -1342,13 +1340,15 @@ class Scheduler(SchedulerInterface):
                 num_scheduled_tokens,
             )
 
-        if (
-            self.cache_config.active_kv_eviction_policy == "paged"
-            and model_runner_output.paged_eviction_block_scores is not None
-        ):
-            for req_id, scores in (
-                model_runner_output.paged_eviction_block_scores.items()
-            ):
+        active_kv_eviction_policy = self.cache_config.active_kv_eviction_policy
+        if active_kv_eviction_policy == "paged":
+            if model_runner_output.paged_eviction_block_scores is None:
+                paged_eviction_block_scores = {}
+            else:
+                paged_eviction_block_scores = (
+                    model_runner_output.paged_eviction_block_scores
+                )
+            for req_id, scores in paged_eviction_block_scores.items():
                 if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
                     continue
                 request = self.requests.get(req_id)
@@ -1363,7 +1363,8 @@ class Scheduler(SchedulerInterface):
                     scores,
                 )
                 prefill_completed = (
-                    prev_num_computed_tokens < request.num_prompt_tokens
+                    prev_num_computed_tokens
+                    < request.num_prompt_tokens
                     <= num_computed_tokens
                 )
                 if prefill_completed:
@@ -1377,6 +1378,39 @@ class Scheduler(SchedulerInterface):
                     block_table_changed = self.kv_cache_manager.apply_paged_eviction(
                         req_id,
                         num_computed_tokens,
+                    )
+                if block_table_changed:
+                    self._active_kv_block_table_update_req_ids.add(req_id)
+        elif active_kv_eviction_policy in ("lru", "random"):
+            for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
+                if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
+                    continue
+                request = self.requests.get(req_id)
+                if request is None or request.is_finished():
+                    continue
+
+                num_computed_tokens = request.num_computed_tokens
+                prev_num_computed_tokens = (
+                    num_computed_tokens - num_tokens_scheduled
+                )
+                prefill_completed = (
+                    prev_num_computed_tokens
+                    < request.num_prompt_tokens
+                    <= num_computed_tokens
+                )
+                if prefill_completed:
+                    block_table_changed = (
+                        self.kv_cache_manager.apply_active_kv_prefill_eviction(
+                            req_id,
+                            num_computed_tokens,
+                        )
+                    )
+                else:
+                    block_table_changed = (
+                        self.kv_cache_manager.apply_active_kv_decode_eviction(
+                            req_id,
+                            num_computed_tokens,
+                        )
                     )
                 if block_table_changed:
                     self._active_kv_block_table_update_req_ids.add(req_id)

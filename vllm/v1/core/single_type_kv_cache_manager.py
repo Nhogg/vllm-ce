@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import random
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
@@ -73,6 +74,8 @@ class SingleTypeKVCacheManager(ABC):
         self.new_block_ids: list[int] = []
 
         # Active pruning for paged eviction
+        self.active_kv_eviction_policy: str = "none"
+        self.active_kv_eviction_budget_blocks: int | None = None
         self.paged_eviction_policy: PagedEvictionPolicy | None = None
         self.paged_eviction_state: PagedEvictionState = PagedEvictionState()
 
@@ -493,6 +496,20 @@ class SingleTypeKVCacheManager(ABC):
             block_size=self.block_size,
         )
 
+    def enable_active_kv_eviction(
+        self,
+        policy: str,
+        cache_budget_tokens: int,
+    ) -> None:
+        if policy == "none":
+            return
+        self.active_kv_eviction_policy = policy
+        self.active_kv_eviction_budget_blocks = (
+            cache_budget_tokens // self.block_size
+        )
+        if policy == "paged":
+            self.enable_paged_eviction(cache_budget_tokens)
+
     def set_paged_eviction_block_scores(
         self,
         request_id: str,
@@ -614,6 +631,100 @@ class SingleTypeKVCacheManager(ABC):
 
         self.block_pool.free_blocks(victim_blocks)
         return True
+
+    def _select_active_kv_victims(
+        self,
+        logical_block_indices: list[int],
+        num_blocks_to_evict: int,
+    ) -> list[int]:
+        if num_blocks_to_evict <= 0:
+            return []
+        num_blocks_to_evict = min(num_blocks_to_evict, len(logical_block_indices))
+        if self.active_kv_eviction_policy == "lru":
+            return logical_block_indices[:num_blocks_to_evict]
+        if self.active_kv_eviction_policy == "random":
+            return random.sample(logical_block_indices, num_blocks_to_evict)
+        raise ValueError(
+            f"Unsupported active KV eviction policy: "
+            f"{self.active_kv_eviction_policy!r}"
+        )
+
+    def _evict_active_kv_logical_blocks(
+        self,
+        request_id: str,
+        victim_indices: list[int],
+    ) -> bool:
+        blocks = self.req_to_blocks[request_id]
+        victim_blocks = []
+        for victim_idx in victim_indices:
+            victim_block = blocks[victim_idx]
+            if victim_block.is_null:
+                continue
+            blocks[victim_idx] = self.block_pool.null_block
+            victim_blocks.append(victim_block)
+
+        if not victim_blocks:
+            return False
+
+        self.block_pool.free_blocks(victim_blocks)
+        return True
+
+    def apply_active_kv_prefill_eviction(
+        self,
+        request_id: str,
+        num_computed_tokens: int,
+    ) -> bool:
+        if self.active_kv_eviction_policy not in ("lru", "random"):
+            return False
+        budget_blocks = self.active_kv_eviction_budget_blocks
+        assert budget_blocks is not None
+
+        blocks = self.req_to_blocks[request_id]
+        num_full_blocks = num_computed_tokens // self.block_size
+        candidates = [
+            i for i, block in enumerate(blocks[:num_full_blocks]) if not block.is_null
+        ]
+        num_blocks_to_evict = len(candidates) - budget_blocks
+        if num_blocks_to_evict <= 0:
+            return False
+
+        victim_indices = self._select_active_kv_victims(
+            candidates,
+            num_blocks_to_evict,
+        )
+        return self._evict_active_kv_logical_blocks(request_id, victim_indices)
+
+    def apply_active_kv_decode_eviction(
+        self,
+        request_id: str,
+        num_computed_tokens: int,
+    ) -> bool:
+        if self.active_kv_eviction_policy not in ("lru", "random"):
+            return False
+        if num_computed_tokens <= 0 or num_computed_tokens % self.block_size != 0:
+            return False
+        budget_blocks = self.active_kv_eviction_budget_blocks
+        assert budget_blocks is not None
+
+        blocks = self.req_to_blocks[request_id]
+        num_full_blocks = num_computed_tokens // self.block_size
+        newest_full_block_idx = num_full_blocks - 1
+        non_null_full_block_indices = [
+            i for i, block in enumerate(blocks[:num_full_blocks]) if not block.is_null
+        ]
+        if len(non_null_full_block_indices) <= budget_blocks:
+            return False
+
+        candidates = [
+            i
+            for i in non_null_full_block_indices
+            if i != newest_full_block_idx
+        ]
+        if not candidates:
+            return False
+
+        victim_indices = self._select_active_kv_victims(candidates, 1)
+        return self._evict_active_kv_logical_blocks(request_id, victim_indices)
 
 
 class FullAttentionManager(SingleTypeKVCacheManager):
