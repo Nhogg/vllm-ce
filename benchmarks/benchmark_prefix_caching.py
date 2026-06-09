@@ -174,22 +174,68 @@ def collect_cache_hit_rate(llm) -> float | None:
         return None
 
 
+def collect_gpu_kv_cache_util(llm) -> float | None:
+    try:
+        for logger in llm.llm_engine.stat_loggers.values():
+            stats = getattr(logger, "last_scheduler_stats", None)
+            if stats is not None:
+                return stats.kv_cache_usage
+    except Exception:
+        return None
+    return None
+
+
 def run_requests_individually(llm, prompts, sampling_params):
-    """Send each prompt one at a time, return list of (e2e_ms, output_tokens)."""
+    """Return per-request timing and vLLM request metrics."""
     results = []
     for prompt in prompts:
         t0 = time.perf_counter()
         outputs = llm.generate([prompt], sampling_params=sampling_params)
         t1 = time.perf_counter()
+
         elapsed_ms = (t1 - t0) * 1000
-        num_output = sum(len(o.outputs[0].token_ids) for o in outputs)
-        results.append((elapsed_ms, num_output))
+        output = outputs[0]
+        num_output = len(output.outputs[0].token_ids)
+
+        metrics = output.metrics
+        ttft_ms = None
+        itl_ms = None
+        tpot_ms = None
+
+        if metrics is not None:
+            ttft_ms = metrics.first_token_latency * 1000
+            if metrics.num_generation_tokens > 1:
+                decode_time_s = metrics.last_token_ts - metrics.first_token_ts
+                itl_ms = decode_time_s * 1000 / (metrics.num_generation_tokens - 1)
+                tpot_ms = itl_ms
+
+        results.append(
+            {
+                "e2e_ms": elapsed_ms,
+                "output_tokens": num_output,
+                "cached_tokens": output.num_cached_tokens or 0,
+                "ttft_ms": ttft_ms,
+                "itl_ms": itl_ms,
+                "tpot_ms": tpot_ms,
+            }
+        )
     return results
 
 
 def compute_stats(latencies_ms: list[float]) -> dict:
     if not latencies_ms:
         return {}
+    if len(latencies_ms) == 1:
+        value = latencies_ms[0]
+        return {
+            "mean_ms": value,
+            "p50_ms": value,
+            "p95_ms": value,
+            "p99_ms": value,
+            "min_ms": value,
+            "max_ms": value,
+            "n": 1,
+        }
     qs = quantiles(latencies_ms, n=100)
     return {
         "mean_ms": mean(latencies_ms),
@@ -200,6 +246,13 @@ def compute_stats(latencies_ms: list[float]) -> dict:
         "max_ms": max(latencies_ms),
         "n": len(latencies_ms),
     }
+
+
+def compute_optional_stats(values: list[float | None]) -> dict:
+    clean = [v for v in values if v is not None]
+    if not clean:
+        return {}
+    return compute_stats(clean)
 
 
 def compute_int_stats(values: list[int]) -> dict:
@@ -246,8 +299,8 @@ def main(args):
 
     prompt_lens = [req.prompt_len for req in filtered_requests]
     print(f"Sampled {len(filtered_requests)} requests.")
-    print(f"  avg input len: {sum(prompt_lens)/len(prompt_lens):.0f}")
-    print(f"  P50 input len: {sorted(prompt_lens)[len(prompt_lens)//2]}")
+    print(f"  avg input len: {sum(prompt_lens) / len(prompt_lens):.0f}")
+    print(f"  P50 input len: {sorted(prompt_lens)[len(prompt_lens) // 2]}")
 
     engine_args = EngineArgs.from_cli_args(args)
 
@@ -280,16 +333,26 @@ def main(args):
     per_request = run_requests_individually(llm, measure_prompts, sampling_params)
     t_batch_end = time.perf_counter()
 
-    latencies_ms = [r[0] for r in per_request]
-    output_tokens_per_request = [r[1] for r in per_request]
-    total_output_tokens = sum(r[1] for r in per_request)
-    total_input_tokens = sum(
-        len(tokenizer(p).input_ids) for p in measure_prompts
-    )
+    latencies_ms = [r["e2e_ms"] for r in per_request]
+    output_tokens_per_request = [r["output_tokens"] for r in per_request]
+    cached_tokens_per_request = [r["cached_tokens"] for r in per_request]
+    ttft_ms = [r["ttft_ms"] for r in per_request]
+    itl_ms = [r["itl_ms"] for r in per_request]
+    tpot_ms = [r["tpot_ms"] for r in per_request]
+    total_input_tokens = sum(len(tokenizer(p).input_ids) for p in measure_prompts)
+    total_output_tokens = sum(output_tokens_per_request)
+    total_cached_tokens = sum(cached_tokens_per_request)
     wall_time_s = t_batch_end - t_batch_start
     throughput_tok_s = (total_input_tokens + total_output_tokens) / wall_time_s
 
     stats = compute_stats(latencies_ms)
+
+    ttft_stats = compute_optional_stats(ttft_ms)
+    itl_stats = compute_optional_stats(itl_ms)
+    tpot_stats = compute_optional_stats(tpot_ms)
+    prefix_cache_hit_rate = (
+        total_cached_tokens / total_input_tokens if total_input_tokens else None
+    )
     output_token_stats = compute_int_stats(output_tokens_per_request)
 
     print("\n=== Results ===")
@@ -301,6 +364,14 @@ def main(args):
     print(f"  E2E latency P99   : {stats['p99_ms']:.1f} ms")
     print(f"  E2E latency mean  : {stats['mean_ms']:.1f} ms")
     print(f"  Throughput        : {throughput_tok_s:.1f} tok/s")
+
+    hit_latencies = [r["e2e_ms"] for r in per_request if r["cached_tokens"] > 0]
+    miss_latencies = [r["e2e_ms"] for r in per_request if r["cached_tokens"] == 0]
+    cache_miss_penalty_ms = None
+    if hit_latencies and miss_latencies:
+        cache_miss_penalty_ms = mean(miss_latencies) - mean(hit_latencies)
+
+    gpu_kv_cache_util = collect_gpu_kv_cache_util(llm)
 
     if args.output_json:
         if args.active_kv_eviction_policy != "none":
@@ -347,6 +418,21 @@ def main(args):
             "wall_time_s": wall_time_s,
             "per_request_latency_ms": latencies_ms,
             "per_request_output_tokens": output_tokens_per_request,
+            "time_to_first_token_ms": ttft_stats.get("mean_ms"),
+            "inter_token_latency_ms": itl_stats.get("mean_ms"),
+            "time_per_output_token_ms": tpot_stats.get("mean_ms"),
+            "prefix_cache_hit_rate": prefix_cache_hit_rate,
+            "cache_miss_penalty_ms": cache_miss_penalty_ms,
+            "recompute_cost_avoided": total_cached_tokens,
+            "eviction_regret": None,
+            "gpu_kv_cache_util": gpu_kv_cache_util,
+            "ttft_stats": ttft_stats,
+            "itl_stats": itl_stats,
+            "tpot_stats": tpot_stats,
+            "per_request_cached_tokens": cached_tokens_per_request,
+            "per_request_ttft_ms": ttft_ms,
+            "per_request_itl_ms": itl_ms,
+            "per_request_tpot_ms": tpot_ms,
         }
         with open(args.output_json, "w") as f:
             json.dump(result, f, indent=2)
