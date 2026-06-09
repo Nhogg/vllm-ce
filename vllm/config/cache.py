@@ -34,6 +34,7 @@ MambaDType = Literal["auto", "float32", "float16"]
 MambaCacheMode = Literal["all", "align", "none"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
 KVOffloadingBackend = Literal["native", "lmcache"]
+ActiveKVEvictionPolicy = Literal["none", "paged"]
 
 
 @config
@@ -108,12 +109,11 @@ class CacheConfig:
     Note that this requires fast CPU-GPU interconnect, as part of the model is
     loaded from CPU memory to GPU memory on the fly in each model forward pass.
     """
-=======
       reproducible hashing. Requires the optional ``xxhash`` package."""
-    enable_paged_eviction: bool = False
-    """Whether to enable PagedEviction active cache pruning."""
-    paged_eviction_cache_budget_tokens: int | None = None
-    """Per-request KV-cache token budget for PagedEviction."""
+    active_kv_eviction_policy: ActiveKVEvictionPolicy = "none"
+    """Active KV-cache eviction/pruning policy for running requests."""
+    active_kv_eviction_cache_budget_tokens: int | None = None
+    """Per-request KV-cache token budget for active KV eviction."""
     calculate_kv_scales: bool = False
     """This enables dynamic calculation of `k_scale` and `v_scale` when
     kv_cache_dtype is fp8. If `False`, the scales will be loaded from the model
@@ -202,6 +202,10 @@ class CacheConfig:
             "enable_prefix_caching",
             "prefix_caching_hash_algo",
             "cpu_kvcache_space_bytes",
+            "active_kv_eviction_policy",
+            "active_kv_eviction_cache_budget_tokens",
+            # Prefix-caching implementation detail (doesn't affect compiled graph).
+            "hash_block_size",
             "mamba_page_size_padded",
             # Post-init/derived counters
             "num_gpu_blocks",
@@ -220,6 +224,48 @@ class CacheConfig:
         # metrics info
         return {key: str(value) for key, value in self.__dict__.items()}
 
+    _block_size_resolved: bool = field(default=False, init=False)
+    """Guard against pydantic re-running _apply_block_size_default."""
+
+    @model_validator(mode="after")
+    def _apply_block_size_default(self) -> "CacheConfig":
+        # Pydantic re-runs validators when CacheConfig is nested inside
+        # another pydantic model (e.g. VllmConfig). Guard against that.
+        if self._block_size_resolved:
+            return self
+        object.__setattr__(self, "_block_size_resolved", True)
+        if self.block_size is None:
+            object.__setattr__(self, "block_size", self.DEFAULT_BLOCK_SIZE)
+        else:
+            object.__setattr__(self, "user_specified_block_size", True)
+        if self.mamba_block_size is not None:
+            object.__setattr__(self, "user_specified_mamba_block_size", True)
+        if self.active_kv_eviction_policy == "paged":
+            if self.active_kv_eviction_cache_budget_tokens is None:
+                raise ValueError(
+                    "active_kv_eviction_cache_budget_tokens must be set when "
+                    "active_kv_eviction_policy is 'paged'."
+                )
+            if self.active_kv_eviction_cache_budget_tokens < self.block_size:
+                raise ValueError(
+                    "active_kv_eviction_cache_budget_tokens must be at least "
+                    "one block."
+                )
+        return self
+
+    @field_validator("calculate_kv_scales", mode="after")
+    @classmethod
+    def _warn_deprecated_calculate_kv_scales(cls, calculate_kv_scales: bool) -> bool:
+        if calculate_kv_scales:
+            logger.warning(
+                "The `--calculate-kv-scales` option is deprecated and will "
+                "be removed in v0.19. The scales will be loaded from the "
+                "model checkpoint if available, otherwise they default to "
+                "1.0."
+            )
+        return calculate_kv_scales
+
+>>>>>>> d6a32d0b0 (Implement prefill prerunning)
     @field_validator("cache_dtype", mode="after")
     @classmethod
     def _validate_cache_dtype(cls, cache_dtype: CacheDType) -> CacheDType:

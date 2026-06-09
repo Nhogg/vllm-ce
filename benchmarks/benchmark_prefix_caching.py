@@ -275,7 +275,8 @@ def main(args):
     stats = compute_stats(latencies_ms)
 
     print("\n=== Results ===")
-    print(f"  Eviction policy   : {args.eviction_policy}")
+    print(f"  Prefix eviction   : {args.eviction_policy}")
+    print(f"  Active KV eviction: {args.active_kv_eviction_policy}")
     print(f"  Requests measured : {stats['n']}")
     print(f"  E2E latency P50   : {stats['p50_ms']:.1f} ms")
     print(f"  E2E latency P95   : {stats['p95_ms']:.1f} ms")
@@ -286,6 +287,10 @@ def main(args):
     if args.output_json:
         result = {
             "eviction_policy": args.eviction_policy,
+            "active_kv_eviction_policy": args.active_kv_eviction_policy,
+            "active_kv_eviction_cache_budget_tokens": (
+                args.active_kv_eviction_cache_budget_tokens
+            ),
             "model": args.model,
             "num_prompts": args.num_prompts,
             "repeat_count": args.repeat_count,
