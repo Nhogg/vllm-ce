@@ -202,6 +202,21 @@ def compute_stats(latencies_ms: list[float]) -> dict:
     }
 
 
+def compute_int_stats(values: list[int]) -> dict:
+    if not values:
+        return {}
+    qs = quantiles(values, n=100)
+    return {
+        "mean": mean(values),
+        "p50": qs[49],
+        "p95": qs[94],
+        "p99": qs[98],
+        "min": min(values),
+        "max": max(values),
+        "n": len(values),
+    }
+
+
 def main(args):
     tokenizer = get_tokenizer(args.model, trust_remote_code=True)
     input_length_range = tuple(map(int, args.input_length_range.split(":")))
@@ -240,6 +255,7 @@ def main(args):
     sampling_params = SamplingParams(
         temperature=0,
         max_tokens=args.output_len,
+        ignore_eos=not args.respect_eos,
         detokenize=not args.disable_detokenize,
     )
 
@@ -263,6 +279,7 @@ def main(args):
     t_batch_end = time.perf_counter()
 
     latencies_ms = [r[0] for r in per_request]
+    output_tokens_per_request = [r[1] for r in per_request]
     total_output_tokens = sum(r[1] for r in per_request)
     total_input_tokens = sum(
         len(tokenizer(p).input_ids) for p in measure_prompts
@@ -271,6 +288,7 @@ def main(args):
     throughput_tok_s = (total_input_tokens + total_output_tokens) / wall_time_s
 
     stats = compute_stats(latencies_ms)
+    output_token_stats = compute_int_stats(output_tokens_per_request)
 
     print("\n=== Results ===")
     print(f"  Prefix eviction   : {args.eviction_policy}")
@@ -320,11 +338,13 @@ def main(args):
             "num_gpu_blocks_override": args.num_gpu_blocks_override,
             "max_model_len": args.max_model_len,
             "latency_stats": stats,
+            "output_token_stats": output_token_stats,
             "throughput_tok_s": throughput_tok_s,
             "total_output_tokens": total_output_tokens,
             "total_input_tokens": total_input_tokens,
             "wall_time_s": wall_time_s,
             "per_request_latency_ms": latencies_ms,
+            "per_request_output_tokens": output_tokens_per_request,
         }
         with open(args.output_json, "w") as f:
             json.dump(result, f, indent=2)
@@ -377,6 +397,15 @@ def create_argument_parser():
         help=(
             "Do not detokenize responses (i.e. do not include "
             "detokenization time in the latency measurement)"
+        ),
+    )
+    parser.add_argument(
+        "--respect-eos",
+        action="store_true",
+        help=(
+            "Allow EOS/stop tokens to end generation before output-len. By "
+            "default this benchmark ignores EOS so all policies generate the "
+            "same number of output tokens."
         ),
     )
     parser.add_argument(
