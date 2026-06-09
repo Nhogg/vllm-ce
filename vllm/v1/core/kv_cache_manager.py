@@ -572,8 +572,18 @@ class KVCacheManager:
         self,
         request_id: str,
         num_computed_tokens: int,
-    ) -> None:
-        self.coordinator.apply_paged_eviction(request_id, num_computed_tokens)
+    ) -> bool:
+        return self.coordinator.apply_paged_eviction(request_id, num_computed_tokens)
+
+    def apply_paged_prefill_eviction(
+        self,
+        request_id: str,
+        num_computed_tokens: int,
+    ) -> bool:
+        return self.coordinator.apply_paged_prefill_eviction(
+            request_id,
+            num_computed_tokens,
+        )
 
     def create_kv_cache_blocks(
         self, blocks: tuple[list[KVCacheBlock], ...]

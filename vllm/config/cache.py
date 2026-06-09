@@ -36,6 +36,7 @@ MambaDType = Literal["auto", "float32", "float16", "bfloat16"]
 MambaCacheMode = Literal["all", "align", "none"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
 KVOffloadingBackend = Literal["native", "lmcache"]
+ActiveKVEvictionPolicy = Literal["none", "paged"]
 
 
 @config
@@ -107,10 +108,10 @@ class CacheConfig:
       security risk tolerance against the performance benefits before turning this on.
     - "xxhash_cbor" combines canonical CBOR serialization with xxHash for
       reproducible hashing. Requires the optional ``xxhash`` package."""
-    enable_paged_eviction: bool = False
-    """Whether to enable PagedEviction active cache pruning."""
-    paged_eviction_cache_budget_tokens: int | None = None
-    """Per-request KV-cache token budget for PagedEviction."""
+    active_kv_eviction_policy: ActiveKVEvictionPolicy = "none"
+    """Active KV-cache eviction/pruning policy for running requests."""
+    active_kv_eviction_cache_budget_tokens: int | None = None
+    """Per-request KV-cache token budget for active KV eviction."""
     calculate_kv_scales: bool = False
     """Deprecated: This option is deprecated and will be removed in v0.19.
     It enables dynamic calculation of `k_scale` and `v_scale` when
@@ -199,6 +200,8 @@ class CacheConfig:
             "num_gpu_blocks_override",
             "enable_prefix_caching",
             "prefix_caching_hash_algo",
+            "active_kv_eviction_policy",
+            "active_kv_eviction_cache_budget_tokens",
             # Prefix-caching implementation detail (doesn't affect compiled graph).
             "hash_block_size",
             "mamba_page_size_padded",
@@ -238,6 +241,17 @@ class CacheConfig:
             object.__setattr__(self, "user_specified_block_size", True)
         if self.mamba_block_size is not None:
             object.__setattr__(self, "user_specified_mamba_block_size", True)
+        if self.active_kv_eviction_policy == "paged":
+            if self.active_kv_eviction_cache_budget_tokens is None:
+                raise ValueError(
+                    "active_kv_eviction_cache_budget_tokens must be set when "
+                    "active_kv_eviction_policy is 'paged'."
+                )
+            if self.active_kv_eviction_cache_budget_tokens < self.block_size:
+                raise ValueError(
+                    "active_kv_eviction_cache_budget_tokens must be at least "
+                    "one block."
+                )
         return self
 
     @field_validator("calculate_kv_scales", mode="after")

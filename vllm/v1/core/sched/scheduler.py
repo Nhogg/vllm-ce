@@ -235,9 +235,11 @@ class Scheduler(SchedulerInterface):
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
             eviction_policy=self.cache_config.eviction_policy,
-            enable_paged_eviction=self.cache_config.enable_paged_eviction,
+            enable_paged_eviction=(
+                self.cache_config.active_kv_eviction_policy == "paged"
+            ),
             paged_eviction_cache_budget_tokens=(
-                self.cache_config.paged_eviction_cache_budget_tokens
+                self.cache_config.active_kv_eviction_cache_budget_tokens
             ),
         )
         # Bind GPU block pool to the KV connector. This must happen after
@@ -278,6 +280,8 @@ class Scheduler(SchedulerInterface):
             # so update_from_output can read slot data even if a later
             # schedule() frees the blocks (async scheduling race).
             self._re_block_ids: dict[str, list[int]] = {}
+
+        self._active_kv_block_table_update_req_ids: set[str] = set()
 
         self._pause_state: PauseState = PauseState.UNPAUSED
 
@@ -940,6 +944,7 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
+        self._active_kv_block_table_update_req_ids.discard(request.request_id)
         self.kv_cache_manager.free(request)
         self.encoder_cache_manager.free(request)
         request.status = RequestStatus.PREEMPTED
@@ -1053,6 +1058,7 @@ class Scheduler(SchedulerInterface):
         num_computed_tokens: list[int] = []
         num_output_tokens: list[int] = []
         resumed_req_ids = set()
+        block_table_update_req_ids: set[str] = set()
 
         num_running_reqs = len(running_reqs)
         for idx, req in enumerate(itertools.chain(running_reqs, resumed_reqs)):
@@ -1080,13 +1086,25 @@ class Scheduler(SchedulerInterface):
                 resumed_req_ids.add(req_id)
             if not scheduled_in_prev_step:
                 all_token_ids[req_id] = req.all_token_ids.copy()
-            new_block_ids.append(
-                req_to_new_blocks[req_id].get_block_ids(allow_none=True)
-            )
+            if req_id in self._active_kv_block_table_update_req_ids:
+                block_table_update_req_ids.add(req_id)
+                new_block_ids.append(
+                    self.kv_cache_manager.get_blocks(req_id).get_block_ids(
+                        allow_none=True
+                    )
+                )
+            else:
+                new_block_ids.append(
+                    req_to_new_blocks[req_id].get_block_ids(allow_none=True)
+                )
             num_computed_tokens.append(req.num_computed_tokens)
             num_output_tokens.append(
                 req.num_output_tokens + req.num_output_placeholders
             )
+
+        self._active_kv_block_table_update_req_ids.difference_update(
+            block_table_update_req_ids
+        )
 
         return CachedRequestData(
             req_ids=req_ids,
@@ -1094,6 +1112,7 @@ class Scheduler(SchedulerInterface):
             new_token_ids=new_token_ids,
             all_token_ids=all_token_ids,
             new_block_ids=new_block_ids,
+            block_table_update_req_ids=block_table_update_req_ids,
             num_computed_tokens=num_computed_tokens,
             num_output_tokens=num_output_tokens,
         )
@@ -1323,31 +1342,44 @@ class Scheduler(SchedulerInterface):
                 num_scheduled_tokens,
             )
 
-        if self.cache_config.enable_paged_eviction:
-            block_size = self.cache_config.block_size
-            for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
+        if (
+            self.cache_config.active_kv_eviction_policy == "paged"
+            and model_runner_output.paged_eviction_block_scores is not None
+        ):
+            for req_id, scores in (
+                model_runner_output.paged_eviction_block_scores.items()
+            ):
                 if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
                     continue
                 request = self.requests.get(req_id)
                 if request is None or request.is_finished():
                     continue
 
-                num_computed_tokens = (
-                    request.num_computed_tokens + num_tokens_scheduled
-                )
-                num_full_blocks = num_computed_tokens // block_size
-                dummy_scores = {
-                    logical_idx: float(logical_idx)
-                    for logical_idx in range(num_full_blocks)
-                }
+                num_tokens_scheduled = num_scheduled_tokens.get(req_id, 0)
+                num_computed_tokens = request.num_computed_tokens
+                prev_num_computed_tokens = num_computed_tokens - num_tokens_scheduled
                 self.kv_cache_manager.set_paged_eviction_block_scores(
                     req_id,
-                    dummy_scores,
+                    scores,
                 )
-                self.kv_cache_manager.apply_paged_eviction(
-                    req_id,
-                    num_computed_tokens,
+                prefill_completed = (
+                    prev_num_computed_tokens < request.num_prompt_tokens
+                    <= num_computed_tokens
                 )
+                if prefill_completed:
+                    block_table_changed = (
+                        self.kv_cache_manager.apply_paged_prefill_eviction(
+                            req_id,
+                            num_computed_tokens,
+                        )
+                    )
+                else:
+                    block_table_changed = self.kv_cache_manager.apply_paged_eviction(
+                        req_id,
+                        num_computed_tokens,
+                    )
+                if block_table_changed:
+                    self._active_kv_block_table_update_req_ids.add(req_id)
 
         # Persist per-step routed experts into the scheduler-side slot
         # buffer (CPU->CPU fancy-index assign; ~few MB per step).
@@ -1878,6 +1910,7 @@ class Scheduler(SchedulerInterface):
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
+        self._active_kv_block_table_update_req_ids.discard(request_id)
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
