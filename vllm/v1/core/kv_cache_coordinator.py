@@ -257,6 +257,17 @@ class KVCacheCoordinator(ABC):
         for manager in self.single_type_managers:
             manager.apply_paged_eviction(request_id, num_computed_tokens)
 
+    def set_paged_eviction_block_scores(
+        self,
+        request_id: str,
+        scores_by_logical_block_idx: dict[int, float],
+    ) -> None:
+        for manager in self.single_type_managers:
+            manager.set_paged_eviction_block_scores(
+                request_id,
+                scores_by_logical_block_idx,
+            )
+
     def remove_skipped_blocks(
         self, request_id: str, total_computed_tokens: int
     ) -> None:

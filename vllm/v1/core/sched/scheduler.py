@@ -1323,6 +1323,32 @@ class Scheduler(SchedulerInterface):
                 num_scheduled_tokens,
             )
 
+        if self.cache_config.enable_paged_eviction:
+            block_size = self.cache_config.block_size
+            for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
+                if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
+                    continue
+                request = self.requests.get(req_id)
+                if request is None or request.is_finished():
+                    continue
+
+                num_computed_tokens = (
+                    request.num_computed_tokens + num_tokens_scheduled
+                )
+                num_full_blocks = num_computed_tokens // block_size
+                dummy_scores = {
+                    logical_idx: float(logical_idx)
+                    for logical_idx in range(num_full_blocks)
+                }
+                self.kv_cache_manager.set_paged_eviction_block_scores(
+                    req_id,
+                    dummy_scores,
+                )
+                self.kv_cache_manager.apply_paged_eviction(
+                    req_id,
+                    num_computed_tokens,
+                )
+
         # Persist per-step routed experts into the scheduler-side slot
         # buffer (CPU->CPU fancy-index assign; ~few MB per step).
         # MUST precede the per-request routing reads below: stopped
