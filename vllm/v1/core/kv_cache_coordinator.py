@@ -43,8 +43,8 @@ class KVCacheCoordinator(ABC):
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
         eviction_policy: str = "lru",
-        enable_paged_eviction: bool = False,
-        paged_eviction_cache_budget_tokens: int | None = None,
+        active_kv_eviction_policy: str = "none",
+        active_kv_eviction_cache_budget_tokens: int | None = None,
     ):
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
@@ -78,14 +78,17 @@ class KVCacheCoordinator(ABC):
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
 
-        if enable_paged_eviction:
-            if paged_eviction_cache_budget_tokens is None:
+        if active_kv_eviction_policy != "none":
+            if active_kv_eviction_cache_budget_tokens is None:
                 raise ValueError(
-                    "paged_eviction_cache_budget_tokens must be set when "
-                    "enable_paged_eviction is True."
+                    "active_kv_eviction_cache_budget_tokens must be set when "
+                    "active_kv_eviction_policy is not 'none'."
                 )
             for manager in self.single_type_managers:
-                manager.enable_paged_eviction(paged_eviction_cache_budget_tokens)
+                manager.enable_active_kv_eviction(
+                    active_kv_eviction_policy,
+                    active_kv_eviction_cache_budget_tokens,
+                )
 
     def get_num_blocks_to_allocate(
         self,
@@ -260,6 +263,32 @@ class KVCacheCoordinator(ABC):
             ) or changed
         return changed
 
+    def apply_active_kv_decode_eviction(
+        self,
+        request_id: str,
+        num_computed_tokens: int,
+    ) -> bool:
+        changed = False
+        for manager in self.single_type_managers:
+            changed = manager.apply_active_kv_decode_eviction(
+                request_id,
+                num_computed_tokens,
+            ) or changed
+        return changed
+
+    def apply_active_kv_prefill_eviction(
+        self,
+        request_id: str,
+        num_computed_tokens: int,
+    ) -> bool:
+        changed = False
+        for manager in self.single_type_managers:
+            changed = manager.apply_active_kv_prefill_eviction(
+                request_id,
+                num_computed_tokens,
+            ) or changed
+        return changed
+
     def set_paged_eviction_block_scores(
         self,
         request_id: str,
@@ -323,8 +352,8 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
         eviction_policy: str = "lru",
-        enable_paged_eviction: bool = False,
-        paged_eviction_cache_budget_tokens: int | None = None,
+        active_kv_eviction_policy: str = "none",
+        active_kv_eviction_cache_budget_tokens: int | None = None,
     ):
         super().__init__(
             kv_cache_config,
@@ -337,8 +366,10 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
             eviction_policy=eviction_policy,
-            enable_paged_eviction=enable_paged_eviction,
-            paged_eviction_cache_budget_tokens=paged_eviction_cache_budget_tokens,
+            active_kv_eviction_policy=active_kv_eviction_policy,
+            active_kv_eviction_cache_budget_tokens=(
+                active_kv_eviction_cache_budget_tokens
+            ),
         )
         self.num_single_type_manager = len(self.single_type_managers)
 
@@ -375,8 +406,8 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
         eviction_policy: str = "lru",
-        enable_paged_eviction: bool = False,
-        paged_eviction_cache_budget_tokens: int | None = None,
+        active_kv_eviction_policy: str = "none",
+        active_kv_eviction_cache_budget_tokens: int | None = None,
     ):
         super().__init__(
             kv_cache_config,
@@ -389,8 +420,10 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
             eviction_policy=eviction_policy,
-            enable_paged_eviction=enable_paged_eviction,
-            paged_eviction_cache_budget_tokens=paged_eviction_cache_budget_tokens,
+            active_kv_eviction_policy=active_kv_eviction_policy,
+            active_kv_eviction_cache_budget_tokens=(
+                active_kv_eviction_cache_budget_tokens
+            ),
         )
         self.kv_cache_spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
         self.block_size = self.kv_cache_spec.block_size
@@ -446,8 +479,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
         eviction_policy: str = "lru",
-        enable_paged_eviction: bool = False,
-        paged_eviction_cache_budget_tokens: int | None = None,
+        active_kv_eviction_policy: str = "none",
+        active_kv_eviction_cache_budget_tokens: int | None = None,
     ):
         super().__init__(
             kv_cache_config,
@@ -460,8 +493,10 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
             eviction_policy=eviction_policy,
-            enable_paged_eviction=enable_paged_eviction,
-            paged_eviction_cache_budget_tokens=paged_eviction_cache_budget_tokens,
+            active_kv_eviction_policy=active_kv_eviction_policy,
+            active_kv_eviction_cache_budget_tokens=(
+                active_kv_eviction_cache_budget_tokens
+            ),
         )
         # hash_block_size: the block size used to compute block hashes.
         # The actual block size usually equals hash_block_size, but in cases where
@@ -608,8 +643,8 @@ def get_kv_cache_coordinator(
     hash_block_size: int,
     metrics_collector: KVCacheMetricsCollector | None = None,
     eviction_policy: str = "lru",
-    enable_paged_eviction: bool = False,
-    paged_eviction_cache_budget_tokens: int | None = None,
+    active_kv_eviction_policy: str = "none",
+    active_kv_eviction_cache_budget_tokens: int | None = None,
 ) -> KVCacheCoordinator:
     if not enable_caching:
         return KVCacheCoordinatorNoPrefixCache(
@@ -622,8 +657,10 @@ def get_kv_cache_coordinator(
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
             eviction_policy=eviction_policy,
-            enable_paged_eviction=enable_paged_eviction,
-            paged_eviction_cache_budget_tokens=paged_eviction_cache_budget_tokens,
+            active_kv_eviction_policy=active_kv_eviction_policy,
+            active_kv_eviction_cache_budget_tokens=(
+                active_kv_eviction_cache_budget_tokens
+            ),
         )
     if len(kv_cache_config.kv_cache_groups) == 1:
         return UnitaryKVCacheCoordinator(
@@ -637,8 +674,10 @@ def get_kv_cache_coordinator(
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
             eviction_policy=eviction_policy,
-            enable_paged_eviction=enable_paged_eviction,
-            paged_eviction_cache_budget_tokens=paged_eviction_cache_budget_tokens,
+            active_kv_eviction_policy=active_kv_eviction_policy,
+            active_kv_eviction_cache_budget_tokens=(
+                active_kv_eviction_cache_budget_tokens
+            ),
         )
     return HybridKVCacheCoordinator(
         kv_cache_config,
@@ -651,6 +690,8 @@ def get_kv_cache_coordinator(
         hash_block_size=hash_block_size,
         metrics_collector=metrics_collector,
         eviction_policy=eviction_policy,
-        enable_paged_eviction=enable_paged_eviction,
-        paged_eviction_cache_budget_tokens=paged_eviction_cache_budget_tokens,
+        active_kv_eviction_policy=active_kv_eviction_policy,
+        active_kv_eviction_cache_budget_tokens=(
+            active_kv_eviction_cache_budget_tokens
+        ),
     )

@@ -34,7 +34,7 @@ MambaDType = Literal["auto", "float32", "float16"]
 MambaCacheMode = Literal["all", "align", "none"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
 KVOffloadingBackend = Literal["native", "lmcache"]
-ActiveKVEvictionPolicy = Literal["none", "paged"]
+ActiveKVEvictionPolicy = Literal["none", "paged", "lru", "random"]
 
 
 @config
@@ -240,16 +240,15 @@ class CacheConfig:
             object.__setattr__(self, "user_specified_block_size", True)
         if self.mamba_block_size is not None:
             object.__setattr__(self, "user_specified_mamba_block_size", True)
-        if self.active_kv_eviction_policy == "paged":
+        if self.active_kv_eviction_policy != "none":
             if self.active_kv_eviction_cache_budget_tokens is None:
                 raise ValueError(
                     "active_kv_eviction_cache_budget_tokens must be set when "
-                    "active_kv_eviction_policy is 'paged'."
+                    "active_kv_eviction_policy is not 'none'."
                 )
             if self.active_kv_eviction_cache_budget_tokens < self.block_size:
                 raise ValueError(
-                    "active_kv_eviction_cache_budget_tokens must be at least "
-                    "one block."
+                    "active_kv_eviction_cache_budget_tokens must be at least one block."
                 )
         return self
 
