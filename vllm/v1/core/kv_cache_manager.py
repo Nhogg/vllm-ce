@@ -378,10 +378,6 @@ class KVCacheManager:
             request.num_tokens,
         )
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
-        self.coordinator.apply_paged_eviction(
-            request.request_id,
-            num_tokens_to_cache,
-        )
 
         return self.create_kv_cache_blocks(new_blocks)
 
@@ -492,6 +488,23 @@ class KVCacheManager:
         """
         if self.enable_caching:
             self.coordinator.cache_blocks(request, num_computed_tokens)
+
+    def set_paged_eviction_block_scores(
+        self,
+        request_id: str,
+        scores_by_logical_block_idx: dict[int, float],
+    ) -> None:
+        self.coordinator.set_paged_eviction_block_scores(
+            request_id,
+            scores_by_logical_block_idx,
+        )
+
+    def apply_paged_eviction(
+        self,
+        request_id: str,
+        num_computed_tokens: int,
+    ) -> None:
+        self.coordinator.apply_paged_eviction(request_id, num_computed_tokens)
 
     def create_kv_cache_blocks(
         self, blocks: tuple[list[KVCacheBlock], ...]
