@@ -279,6 +279,11 @@ class ModelRunnerOutput:
     # ``None`` when ``enable_return_routed_experts`` is off.
     routed_experts: RoutedExpertsLists | None = None
 
+    # req_id -> logical_block_idx -> PagedEviction block score.
+    # Produced by the worker after K/V cache update and consumed by the
+    # scheduler before active KV eviction.
+    paged_eviction_block_scores: dict[str, dict[int, float]] | None = None
+
 
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):

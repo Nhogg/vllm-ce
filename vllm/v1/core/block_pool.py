@@ -395,8 +395,8 @@ class BlockPool:
             # eviction is not needed
             return False
 
-        block.reset_hash()
         self.eviction_policy.on_block_evicted(block)
+        block.reset_hash()
 
         if self.enable_kv_cache_events:
             self.kv_event_queue.append(
