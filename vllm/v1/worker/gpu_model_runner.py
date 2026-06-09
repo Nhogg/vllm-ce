@@ -977,6 +977,7 @@ class GPUModelRunner(
             num_computed_tokens = req_data.num_computed_tokens[i]
             new_block_ids = req_data.new_block_ids[i]
             resumed_from_preemption = req_id in req_data.resumed_req_ids
+            replace_block_ids = req_id in req_data.block_table_update_req_ids
             num_output_tokens = req_data.num_output_tokens[i]
             req_index = self.input_batch.req_id_to_index.get(req_id)
 
@@ -1034,7 +1035,10 @@ class GPUModelRunner(
                     self.input_batch.num_tokens_no_spec[req_index] = end_idx
 
             # Update the block IDs.
-            if not resumed_from_preemption:
+            if replace_block_ids:
+                assert new_block_ids is not None
+                req_state.block_ids = new_block_ids
+            elif not resumed_from_preemption:
                 if new_block_ids is not None:
                     # Append the new blocks to the existing block IDs.
                     for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
@@ -1063,7 +1067,10 @@ class GPUModelRunner(
             # Update the persistent batch.
             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
             if new_block_ids is not None:
-                self.input_batch.block_table.append_row(new_block_ids, req_index)
+                if replace_block_ids:
+                    self.input_batch.block_table.add_row(new_block_ids, req_index)
+                else:
+                    self.input_batch.block_table.append_row(new_block_ids, req_index)
 
             # For the last rank, we don't need to update the token_ids_cpu
             # because the sampled tokens are already cached.
@@ -2959,6 +2966,117 @@ class GPUModelRunner(
             invalid_req_indices,
         )
 
+    def _score_kv_cache_pages(
+        self,
+        k_pages: torch.Tensor,
+        v_pages: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return one PagedEviction score per selected physical KV page."""
+        block_size = self.cache_config.block_size
+        if k_pages.ndim >= 3 and k_pages.shape[1] == block_size:
+            token_dim = 1
+        elif k_pages.ndim >= 4 and k_pages.shape[2] == block_size:
+            token_dim = 2
+        else:
+            k_flat = k_pages.float().reshape(k_pages.shape[0], -1)
+            v_flat = v_pages.float().reshape(v_pages.shape[0], -1)
+            return torch.linalg.vector_norm(v_flat, dim=-1) / (
+                torch.linalg.vector_norm(k_flat, dim=-1) + 1e-6
+            )
+
+        if token_dim != 1:
+            k_pages = k_pages.movedim(token_dim, 1)
+            v_pages = v_pages.movedim(token_dim, 1)
+        k_flat = k_pages.float().reshape(k_pages.shape[0], k_pages.shape[1], -1)
+        v_flat = v_pages.float().reshape(v_pages.shape[0], v_pages.shape[1], -1)
+        token_scores = torch.linalg.vector_norm(v_flat, dim=-1) / (
+            torch.linalg.vector_norm(k_flat, dim=-1) + 1e-6
+        )
+        return token_scores.mean(dim=1)
+
+    def _compute_paged_eviction_block_scores(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> dict[str, dict[int, float]] | None:
+        if self.cache_config.active_kv_eviction_policy != "paged":
+            return None
+        if not self.kv_caches or not self.kv_cache_config.kv_cache_groups:
+            return None
+
+        block_table = self.input_batch.block_table[0].get_cpu_tensor().numpy()
+        req_ids = list(scheduler_output.num_scheduled_tokens.keys())
+        logical_block_ids: dict[str, list[tuple[int, int]]] = {}
+        unique_block_ids: set[int] = set()
+        for req_id in req_ids:
+            req_index = self.input_batch.req_id_to_index.get(req_id)
+            if req_index is None:
+                continue
+            num_computed_tokens = (
+                int(self.input_batch.num_computed_tokens_cpu[req_index])
+                + int(scheduler_output.num_scheduled_tokens[req_id])
+            )
+            num_full_blocks = num_computed_tokens // self.cache_config.block_size
+            row = block_table[req_index]
+            block_ids = [
+                (logical_idx, int(block_id))
+                for logical_idx, block_id in enumerate(
+                    row[: min(num_full_blocks, len(row))]
+                )
+                if int(block_id) > 0
+            ]
+            if block_ids:
+                logical_block_ids[req_id] = block_ids
+                unique_block_ids.update(block_id for _, block_id in block_ids)
+
+        if not unique_block_ids:
+            return None
+
+        sorted_block_ids = sorted(unique_block_ids)
+        block_ids_tensor = torch.tensor(
+            sorted_block_ids, dtype=torch.long, device=self.device
+        )
+        score_sum: dict[int, float] = {block_id: 0.0 for block_id in sorted_block_ids}
+        score_count: dict[int, int] = {block_id: 0 for block_id in sorted_block_ids}
+
+        for kv_cache in self.kv_caches:
+            if (
+                not isinstance(kv_cache, torch.Tensor)
+                or not kv_cache.is_floating_point()
+            ):
+                continue
+            if kv_cache.ndim >= 5 and kv_cache.shape[1] == 2:
+                k_pages = kv_cache[block_ids_tensor, 0]
+                v_pages = kv_cache[block_ids_tensor, 1]
+            elif kv_cache.ndim >= 5 and kv_cache.shape[0] == 2:
+                k_pages = kv_cache[0, block_ids_tensor]
+                v_pages = kv_cache[1, block_ids_tensor]
+            else:
+                continue
+
+            scores = self._score_kv_cache_pages(k_pages, v_pages).detach().cpu()
+            for block_id, score in zip(sorted_block_ids, scores.tolist()):
+                score_sum[block_id] += float(score)
+                score_count[block_id] += 1
+
+        block_scores = {
+            block_id: score_sum[block_id] / score_count[block_id]
+            for block_id in sorted_block_ids
+            if score_count[block_id] > 0
+        }
+        if not block_scores:
+            return None
+
+        result: dict[str, dict[int, float]] = {}
+        for req_id, block_ids in logical_block_ids.items():
+            scores_by_logical_block = {
+                logical_idx: block_scores[block_id]
+                for logical_idx, block_id in block_ids
+                if block_id in block_scores
+            }
+            if scores_by_logical_block:
+                result[req_id] = scores_by_logical_block
+        return result or None
+
     @contextmanager
     def synchronize_input_prep(self):
         if self.prepare_inputs_event is None:
@@ -3703,6 +3821,13 @@ class GPUModelRunner(
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()
 
+        # self.kv_connector_output may be modified during drafting
+        kv_connector_output = self.kv_connector_output
+        self.kv_connector_output = None
+        paged_eviction_block_scores = self._compute_paged_eviction_block_scores(
+            scheduler_output
+        )
+
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.model_config.enable_return_routed_experts:
                 capturer = RoutedExpertsCapturer.get_instance()
@@ -3723,6 +3848,8 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
+                routed_experts=None,
+                paged_eviction_block_scores=paged_eviction_block_scores,
             )
 
         if not self.use_async_scheduling:

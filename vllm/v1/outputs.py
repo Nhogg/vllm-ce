@@ -187,6 +187,22 @@ class ModelRunnerOutput:
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 
+    # Per-step routed experts data captured by the worker.
+    # ``routing_data`` shape: (num_scheduled_tokens, num_layers,
+    #                         num_experts_per_tok); expert IDs as uint8/uint16.
+    # ``slot_mapping`` shape: (num_scheduled_tokens,); physical KV-cache
+    #                         slot for each row of routing_data.
+    # ``num_scheduled_tokens`` is step-level (total across all requests
+    # in this step), not per-request. The scheduler persists this into
+    # its slot buffer via ``slot_buffer[slot_mapping] = routing_data``.
+    # ``None`` when ``enable_return_routed_experts`` is off.
+    routed_experts: RoutedExpertsLists | None = None
+
+    # req_id -> logical_block_idx -> PagedEviction block score.
+    # Produced by the worker after K/V cache update and consumed by the
+    # scheduler before active KV eviction.
+    paged_eviction_block_scores: dict[str, dict[int, float]] | None = None
+
 
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):

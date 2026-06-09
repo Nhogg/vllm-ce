@@ -362,8 +362,8 @@ class BlockPool:
             # eviction is not needed
             return False
 
-        block.reset_hash()
         self.eviction_policy.on_block_evicted(block)
+        block.reset_hash()
 
         if self.enable_kv_cache_events:
             # FIXME (Chen): Not sure whether we should return `hash_value`

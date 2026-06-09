@@ -58,6 +58,7 @@ from vllm.config import (
 )
 from vllm.config.cache import (
     BlockSize,
+    ActiveKVEvictionPolicy,
     CacheDType,
     KVOffloadingBackend,
     MambaCacheMode,
@@ -560,6 +561,12 @@ class EngineArgs:
     mamba_cache_mode: MambaCacheMode = CacheConfig.mamba_cache_mode
 
     eviction_policy: str = CacheConfig.eviction_policy
+    active_kv_eviction_policy: ActiveKVEvictionPolicy = (
+        CacheConfig.active_kv_eviction_policy
+    )
+    active_kv_eviction_cache_budget_tokens: int | None = (
+        CacheConfig.active_kv_eviction_cache_budget_tokens
+    )
 
     mamba_backend: MambaBackendEnum = MambaBackendEnum.TRITON
     enable_mamba_cache_stochastic_rounding: bool = (
@@ -931,6 +938,14 @@ class EngineArgs:
             },
         )
         cache_group.add_argument("--eviction-policy", **cache_kwargs["eviction_policy"])
+        cache_group.add_argument(
+            "--active-kv-eviction-policy",
+            **cache_kwargs["active_kv_eviction_policy"],
+        )
+        cache_group.add_argument(
+            "--active-kv-eviction-cache-budget-tokens",
+            **cache_kwargs["active_kv_eviction_cache_budget_tokens"],
+        )
         cache_group.add_argument(
             "--prefix-caching-hash-algo", **cache_kwargs["prefix_caching_hash_algo"]
         )
@@ -1432,6 +1447,10 @@ class EngineArgs:
             mamba_block_size=self.mamba_block_size,
             mamba_cache_mode=self.mamba_cache_mode,
             eviction_policy=self.eviction_policy,
+            active_kv_eviction_policy=self.active_kv_eviction_policy,
+            active_kv_eviction_cache_budget_tokens=(
+                self.active_kv_eviction_cache_budget_tokens
+            ),
             kv_offloading_size=self.kv_offloading_size,
             kv_offloading_backend=self.kv_offloading_backend,
         )
