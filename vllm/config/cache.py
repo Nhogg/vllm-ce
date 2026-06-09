@@ -94,7 +94,6 @@ class CacheConfig:
     """KV cache eviction policy when prefix caching is enabled"""
     prefix_caching_hash_algo: PrefixCachingHashAlgo = "sha256"
     """Set the hash algorithm for prefix caching:
-
     - "sha256" uses Pickle for object serialization before hashing. This is the current
       default, as SHA256 is the most secure choice to avoid potential hash collisions.
     - "sha256_cbor" provides a reproducible, cross-language compatible hash. It
@@ -108,6 +107,10 @@ class CacheConfig:
       security risk tolerance against the performance benefits before turning this on.
     - "xxhash_cbor" combines canonical CBOR serialization with xxHash for
       reproducible hashing. Requires the optional ``xxhash`` package."""
+    enable_paged_eviction: bool = False
+    """Whether to enable PagedEviction active cache pruning."""
+    paged_eviction_cache_budget_tokens: int | None = None
+    """Per-request KV-cache token budget for PagedEviction."""
     calculate_kv_scales: bool = False
     """Deprecated: This option is deprecated and will be removed in v0.19.
     It enables dynamic calculation of `k_scale` and `v_scale` when

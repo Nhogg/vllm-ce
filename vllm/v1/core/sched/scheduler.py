@@ -235,6 +235,10 @@ class Scheduler(SchedulerInterface):
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
             eviction_policy=self.cache_config.eviction_policy,
+            enable_paged_eviction=self.cache_config.enable_paged_eviction,
+            paged_eviction_cache_budget_tokens=(
+                self.cache_config.paged_eviction_cache_budget_tokens
+            ),
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.

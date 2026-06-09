@@ -44,6 +44,8 @@ class KVCacheCoordinator(ABC):
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
         eviction_policy: str = "lru",
+        enable_paged_eviction: bool = False,
+        paged_eviction_cache_budget_tokens: int | None = None,
     ):
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
@@ -79,6 +81,15 @@ class KVCacheCoordinator(ABC):
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
+
+        if enable_paged_eviction:
+            if paged_eviction_cache_budget_tokens is None:
+                raise ValueError(
+                    "paged_eviction_cache_budget_tokens must be set when "
+                    "enable_paged_eviction is True."
+                )
+            for manager in self.single_type_managers:
+                manager.enable_paged_eviction(paged_eviction_cache_budget_tokens)
 
     def get_num_blocks_to_allocate(
         self,
@@ -237,6 +248,14 @@ class KVCacheCoordinator(ABC):
             manager.get_num_common_prefix_blocks(running_request_id)
             for manager in self.single_type_managers
         ]
+
+    def apply_paged_eviction(
+        self,
+        request_id: str,
+        num_computed_tokens: int,
+    ) -> None:
+        for manager in self.single_type_managers:
+            manager.apply_paged_eviction(request_id, num_computed_tokens)
 
     def remove_skipped_blocks(
         self, request_id: str, total_computed_tokens: int

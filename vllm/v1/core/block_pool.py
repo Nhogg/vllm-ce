@@ -172,7 +172,6 @@ class BlockPool:
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
-        self.eviction_policy.on_block_cached(blk)
 
         # To represent a placeholder block with block_id=0.
         # The ref_cnt of null_block is not maintained, needs special care to
@@ -284,6 +283,7 @@ class BlockPool:
             )
             blk.block_hash = block_hash_with_group_id
             self.cached_block_hash_to_block.insert(block_hash_with_group_id, blk)
+            self.eviction_policy.on_block_cached(blk)
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
 
@@ -422,7 +422,7 @@ class BlockPool:
             if block.ref_cnt == 0 and not block.is_null:
                 self.free_block_queue.remove(block)
             block.ref_cnt += 1
-            self.eviction_policy.on_block_cached(block_hash_with_group_id, blk)
+            self.eviction_policy.on_block_accessed(block)
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
 
@@ -438,14 +438,10 @@ class BlockPool:
         blocks_list = list(ordered_blocks)
         for block in blocks_list:
             block.ref_cnt -= 1
-        self.free_block_queue.append_n(
-            [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
-        )
-
         freed_blocks = [
-                block for block blocks_list if block.ref_cnt == 0 and not block.is_null
-                ]
-        self.free_block_queue.append(freed_blocks)
+            block for block in blocks_list if block.ref_cnt == 0 and not block.is_null
+        ]
+        self.free_block_queue.append_n(freed_blocks)
         for block in freed_blocks:
             self.eviction_policy.on_block_freed(block)
 
@@ -496,6 +492,8 @@ class BlockPool:
 
         if self.metrics_collector:
             self.metrics_collector.reset()
+
+        self.eviction_policy.on_reset()
 
         logger.info("Successfully reset prefix cache")
 
