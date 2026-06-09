@@ -84,6 +84,9 @@ class CacheConfig:
     - "sha256" uses Pickle for object serialization before hashing. This is the
     current default, as SHA256 is the most secure choice to avoid potential
     hash collisions.\n
+    """Set the hash algorithm for prefix caching:
+    - "sha256" uses Pickle for object serialization before hashing. This is the current
+      default, as SHA256 is the most secure choice to avoid potential hash collisions.
     - "sha256_cbor" provides a reproducible, cross-language compatible hash. It
     serializes objects using canonical CBOR and hashes them with SHA-256.\n
     - "xxhash" uses Pickle serialization with xxHash (128-bit) for faster,
@@ -105,6 +108,12 @@ class CacheConfig:
     Note that this requires fast CPU-GPU interconnect, as part of the model is
     loaded from CPU memory to GPU memory on the fly in each model forward pass.
     """
+=======
+      reproducible hashing. Requires the optional ``xxhash`` package."""
+    enable_paged_eviction: bool = False
+    """Whether to enable PagedEviction active cache pruning."""
+    paged_eviction_cache_budget_tokens: int | None = None
+    """Per-request KV-cache token budget for PagedEviction."""
     calculate_kv_scales: bool = False
     """This enables dynamic calculation of `k_scale` and `v_scale` when
     kv_cache_dtype is fp8. If `False`, the scales will be loaded from the model

@@ -226,6 +226,10 @@ class Scheduler(SchedulerInterface):
             hash_block_size=self.block_size,
             metrics_collector=self.kv_metrics_collector,
             eviction_policy=self.cache_config.eviction_policy,
+            enable_paged_eviction=self.cache_config.enable_paged_eviction,
+            paged_eviction_cache_budget_tokens=(
+                self.cache_config.paged_eviction_cache_budget_tokens
+            ),
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER

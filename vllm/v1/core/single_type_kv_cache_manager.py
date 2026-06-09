@@ -8,6 +8,15 @@ from collections.abc import Sequence
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import BlockHashList, KVCacheBlock
+from vllm.v1.core.eviction.paged_eviction import (
+    PagedEvictionPolicy,
+    PagedEvictionState,
+)
+from vllm.v1.core.kv_cache_utils import (
+    BlockHashList,
+    BlockHashWithGroupId,
+    KVCacheBlock,
+)
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     CrossAttentionSpec,
@@ -51,6 +60,10 @@ class SingleTypeKVCacheManager(ABC):
         self.kv_cache_spec = kv_cache_spec
         self.block_pool = block_pool
         self.enable_caching = enable_caching
+
+        # Active pruning for paged eviction
+        self.paged_eviction_policy: PagedEvictionPolicy | None = None
+        self.paged_eviction_state: PagedEvictionState = PagedEvictionState()
 
         # Mapping from request ID to blocks to track the blocks allocated
         # for each request, so that we can free the blocks when the request
@@ -274,6 +287,7 @@ class SingleTypeKVCacheManager(ABC):
 
         self.block_pool.free_blocks(ordered_blocks)
         self.num_cached_block.pop(request_id, None)
+        self.paged_eviction_state.reset_request(request_id)
 
     @abstractmethod
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
@@ -395,6 +409,85 @@ class SingleTypeKVCacheManager(ABC):
         """
         # The default behavior is to not skip any tokens.
         return 0
+
+    def new_step_starts(self) -> None:
+        # do nothing by default
+        return None
+
+    def enable_paged_eviction(self, cache_budget_tokens: int) -> None:
+        """Enable PagedEviction for this KV cache manager."""
+        self.paged_eviction_policy = PagedEvictionPolicy(
+            cache_budget_tokens=cache_budget_tokens,
+            block_size=self.block_size,
+        )
+
+    def set_paged_eviction_block_scores(
+        self,
+        request_id: str,
+        scores_by_logical_block_idx: dict[int, float],
+    ) -> None:
+        """Called by model / attention side after block scoring"""
+        self.paged_eviction_state.set_request_block_scores(
+            request_id=request_id,
+            scores_by_logical_block_idx=scores_by_logical_block_idx,
+        )
+
+    def apply_paged_eviction(
+        self,
+        request_id: str,
+        num_computed_tokens: int,
+    ) -> None:
+        """Evict one active KV block
+
+        This mirrors SlidingWindowManager.remove_skipped_blocks:
+        - pick active request block
+        - replace it with null_block
+        - free physical blocks
+
+        The block table remains block-aligned.
+        """
+        policy = self.paged_eviction_policy
+        if policy is None:
+            return
+
+        if not policy.should_run_decode_eviction(num_computed_tokens):
+            return
+
+        blocks = self.req_to_blocks[request_id]
+
+        num_full_blocks = num_computed_tokens // self.block_size
+        newest_full_block_idx = num_full_blocks - 1
+
+        logical_block_indices = [
+            i
+            for i, block in enumerate(blocks[:num_full_blocks])
+            if (block != self.block_pool.null_block and i != newest_full_block_idx)
+        ]
+
+        decision = policy.select_victim_logical_block(
+            request_id=request_id,
+            logical_block_indices=logical_block_indices,
+            scores_by_logical_block_idx=(
+                self.paged_eviction_state.block_scores.get(request_id, {})
+            ),
+            num_computed_tokens=num_computed_tokens,
+        )
+
+        if not decision.should_evict:
+            return
+
+        victim_idx = decision.victim_logical_block_idx
+        assert victim_idx is not None
+
+        victim_block = blocks[victim_idx]
+
+        if victim_block == self.block_pool.null_block:
+            return
+
+        blocks[victim_idx] = self.block_pool.null_block
+        self.block_pool.free_blocks([victim_block])
+        self.paged_eviction_state.record_eviction(request_id)
+        self.paged_eviction_state.remove_request_block_score(request_id, victim_idx)
 
 
 class FullAttentionManager(SingleTypeKVCacheManager):

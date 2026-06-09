@@ -105,6 +105,8 @@ class KVCacheManager:
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
         eviction_policy: str = "lru",
+        enable_paged_eviction: bool = False,
+        paged_eviction_cache_budget_tokens: int | None = None,
     ) -> None:
         self.max_model_len = max_model_len
 
@@ -128,6 +130,8 @@ class KVCacheManager:
             hash_block_size=hash_block_size,
             metrics_collector=self.metrics_collector,
             eviction_policy=eviction_policy,
+            enable_paged_eviction=enable_paged_eviction,
+            paged_eviction_cache_budget_tokens=paged_eviction_cache_budget_tokens,
         )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
@@ -374,6 +378,10 @@ class KVCacheManager:
             request.num_tokens,
         )
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
+        self.coordinator.apply_paged_eviction(
+            request.request_id,
+            num_tokens_to_cache,
+        )
 
         return self.create_kv_cache_blocks(new_blocks)
 
