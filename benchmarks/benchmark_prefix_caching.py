@@ -283,18 +283,42 @@ def main(args):
     print(f"  Throughput        : {throughput_tok_s:.1f} tok/s")
 
     if args.output_json:
+        if args.active_kv_eviction_policy != "none":
+            cache_eviction_type = "active_kv"
+            cache_eviction_policy = args.active_kv_eviction_policy
+            cache_eviction_label = args.active_kv_eviction_policy
+            if args.active_kv_eviction_cache_budget_tokens is not None:
+                cache_eviction_label = (
+                    f"{cache_eviction_label}-"
+                    f"{args.active_kv_eviction_cache_budget_tokens}"
+                )
+        else:
+            cache_eviction_type = "prefix"
+            cache_eviction_policy = args.eviction_policy
+            cache_eviction_label = args.eviction_policy
+
         result = {
             "eviction_policy": args.eviction_policy,
             "active_kv_eviction_policy": args.active_kv_eviction_policy,
             "active_kv_eviction_cache_budget_tokens": (
                 args.active_kv_eviction_cache_budget_tokens
             ),
+            "cache_eviction_type": cache_eviction_type,
+            "cache_eviction_policy": cache_eviction_policy,
+            "cache_eviction_label": cache_eviction_label,
             "model": args.model,
             "num_prompts": args.num_prompts,
             "repeat_count": args.repeat_count,
             "warmup_rounds": args.warmup_rounds,
+            "input_length_range": args.input_length_range,
             "output_len": args.output_len,
             "prefix_len": args.prefix_len,
+            "dataset_path": args.dataset_path,
+            "seed": args.seed,
+            "sort": args.sort,
+            "enable_prefix_caching": args.enable_prefix_caching,
+            "num_gpu_blocks_override": args.num_gpu_blocks_override,
+            "max_model_len": args.max_model_len,
             "latency_stats": stats,
             "throughput_tok_s": throughput_tok_s,
             "total_output_tokens": total_output_tokens,

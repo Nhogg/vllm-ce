@@ -10,5 +10,7 @@ def get_eviction_policy(name: str) -> EvictionPolicy:
     if name == "random":
         return RandomEvictionPolicy()
     if name == "arc":
-        return ARCEvictionPolicy
-    raise ValueError(f"Unknown eviction policy: {name!r}. Choose 'lru' or 'random'.")
+        return ARCEvictionPolicy()
+    raise ValueError(
+        f"Unknown eviction policy: {name!r}. Choose 'lru', 'random', or 'arc'."
+    )
