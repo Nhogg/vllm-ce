@@ -175,11 +175,30 @@ def collect_cache_hit_rate(llm) -> float | None:
 
 
 def collect_gpu_kv_cache_util(llm) -> float | None:
+    def collect_from_logger(logger) -> list[float]:
+        stats = getattr(logger, "last_scheduler_stats", None)
+        if stats is not None:
+            return [stats.kv_cache_usage]
+
+        per_engine_loggers = getattr(logger, "per_engine_stat_loggers", None)
+        if per_engine_loggers is None:
+            return []
+
+        values = []
+        for per_engine_logger in per_engine_loggers.values():
+            values.extend(collect_from_logger(per_engine_logger))
+        return values
+
     try:
-        for logger in llm.llm_engine.stat_loggers.values():
-            stats = getattr(logger, "last_scheduler_stats", None)
-            if stats is not None:
-                return stats.kv_cache_usage
+        logger_manager = getattr(llm.llm_engine, "logger_manager", None)
+        if logger_manager is None:
+            return None
+
+        values = []
+        for logger in getattr(logger_manager, "stat_loggers", []):
+            values.extend(collect_from_logger(logger))
+        if values:
+            return sum(values) / len(values)
     except Exception:
         return None
     return None
