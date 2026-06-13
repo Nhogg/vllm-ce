@@ -24,9 +24,20 @@ from typing import (
     get_origin,
 )
 
+import enum
+
 import huggingface_hub
 import regex as re
 import torch
+
+
+class MambaBackendEnum(enum.Enum):
+    TRITON = "triton"
+
+
+class MambaConfig:
+    enable_stochastic_rounding: bool = False
+    stochastic_rounding_philox_rounds: int = 10
 from pydantic import TypeAdapter, ValidationError
 from pydantic.fields import FieldInfo
 from typing_extensions import TypeIs

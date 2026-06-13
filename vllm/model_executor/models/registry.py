@@ -734,10 +734,20 @@ class _LazyRegisteredModel(_BaseRegisteredModel):
                     self.class_name,
                 )
 
-        # Performed in another process to avoid initializing CUDA
-        mi = _run_in_subprocess(
-            lambda: _ModelInfo.from_model_cls(self.load_model_cls())
-        )
+        # Performed in another process to avoid initializing CUDA.
+        # Fall back to in-process if the subprocess crashes (e.g. XPU SIGSEGV).
+        try:
+            mi = _run_in_subprocess(
+                lambda: _ModelInfo.from_model_cls(self.load_model_cls())
+            )
+        except RuntimeError:
+            logger.warning(
+                "Subprocess model inspection failed for %s.%s, "
+                "falling back to in-process inspection.",
+                self.module_name,
+                self.class_name,
+            )
+            mi = _ModelInfo.from_model_cls(self.load_model_cls())
         logger.debug(
             "Loaded model info for class %s.%s", self.module_name, self.class_name
         )

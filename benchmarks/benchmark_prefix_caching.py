@@ -277,6 +277,10 @@ def compute_optional_stats(values: list[float | None]) -> dict:
 def compute_int_stats(values: list[int]) -> dict:
     if not values:
         return {}
+    if len(values) == 1:
+        value = values[0]
+        return {"mean": value, "p50": value, "p95": value, "p99": value,
+                "min": value, "max": value, "n": 1}
     qs = quantiles(values, n=100)
     return {
         "mean": mean(values),
@@ -324,7 +328,6 @@ def main(args):
     engine_args = EngineArgs.from_cli_args(args)
 
     llm = LLM(**dataclasses.asdict(engine_args))
-    llm = LLM.from_engine_args(engine_args)
 
     sampling_params = SamplingParams(
         temperature=0,

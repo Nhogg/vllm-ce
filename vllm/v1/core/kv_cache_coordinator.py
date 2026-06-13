@@ -56,11 +56,6 @@ class KVCacheCoordinator(ABC):
             hash_block_size,
             enable_kv_cache_events,
             metrics_collector,
-            num_gpu_blocks=kv_cache_config.num_blocks,
-            enable_caching=enable_caching,
-            hash_block_size=hash_block_size,
-            enable_kv_cache_events=enable_kv_cache_events,
-            metrics_collector=metrics_collector,
             eviction_policy=get_eviction_policy(eviction_policy),
         )
 

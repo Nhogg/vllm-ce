@@ -1,8 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import enum
 import itertools
 import time
 from collections import defaultdict, deque
+
+
+class PauseState(enum.Enum):
+    UNPAUSED = "unpaused"
+    PAUSED = "paused"
 from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any

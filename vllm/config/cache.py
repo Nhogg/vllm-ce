@@ -5,7 +5,7 @@ import math
 from dataclasses import field
 from typing import TYPE_CHECKING, Any, Literal
 
-from pydantic import Field, SkipValidation, field_validator
+from pydantic import Field, SkipValidation, field_validator, model_validator
 from pydantic.dataclasses import dataclass
 
 from vllm.config.utils import config
@@ -82,7 +82,6 @@ class CacheConfig:
     """KV cache eviction policy when prefix caching is enabled"""
     prefix_caching_hash_algo: PrefixCachingHashAlgo = "sha256"
     """Set the hash algorithm for prefix caching:\n
-    - "sha256" uses Pickle for object serialization before hashing. This is the
     current default, as SHA256 is the most secure choice to avoid potential
     hash collisions.\n
     """Set the hash algorithm for prefix caching:
@@ -264,7 +263,6 @@ class CacheConfig:
             )
         return calculate_kv_scales
 
->>>>>>> d6a32d0b0 (Implement prefill prerunning)
     @field_validator("cache_dtype", mode="after")
     @classmethod
     def _validate_cache_dtype(cls, cache_dtype: CacheDType) -> CacheDType:

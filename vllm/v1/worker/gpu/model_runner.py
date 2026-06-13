@@ -397,7 +397,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if scores_by_logical_block:
                 result[req_id] = scores_by_logical_block
         return result or None
->>>>>>> 105cb7da0 (Implement ARC)
 
     @torch.inference_mode()
     def _dummy_run(
