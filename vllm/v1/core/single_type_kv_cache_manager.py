@@ -129,6 +129,18 @@ class SingleTypeKVCacheManager(ABC):
         """
 
         num_required_blocks = cdiv(num_tokens, self.block_size)
+        if (
+            self.active_kv_eviction_policy == "paged"
+            and self.paged_eviction_policy is not None
+            and self.paged_eviction_state.has_prefill_eviction(request_id)
+        ):
+            budget_blocks = self.paged_eviction_policy.budget_blocks
+            if num_tokens > self.paged_eviction_policy.cache_budget_tokens:
+                num_required_blocks = budget_blocks
+                if num_tokens % self.block_size != 0:
+                    # After decode starts, PagedEviction can temporarily hold a
+                    # partial newest page in addition to the full-page budget.
+                    num_required_blocks += 1
         if apply_admission_cap and self._max_admission_blocks_per_request is not None:
             # Recycling-aware specs (SWA, chunked-local) cap the per-request
             # reservation here so admission matches the startup pool sizer
@@ -270,6 +282,16 @@ class SingleTypeKVCacheManager(ABC):
         """
         req_blocks = self.req_to_blocks[request_id]
         num_required_blocks = cdiv(num_tokens, self.block_size)
+        if (
+            self.active_kv_eviction_policy == "paged"
+            and self.paged_eviction_policy is not None
+            and self.paged_eviction_state.has_prefill_eviction(request_id)
+        ):
+            budget_blocks = self.paged_eviction_policy.budget_blocks
+            if num_tokens > self.paged_eviction_policy.cache_budget_tokens:
+                num_required_blocks = budget_blocks
+                if num_tokens % self.block_size != 0:
+                    num_required_blocks += 1
         num_new_blocks = num_required_blocks - len(req_blocks)
         if num_new_blocks <= 0:
             return []
@@ -574,13 +596,16 @@ class SingleTypeKVCacheManager(ABC):
         victim_idx = decision.victim_logical_block_idx
         assert victim_idx is not None
 
-        victim_block = blocks[victim_idx]
-
+        victim_block = blocks.pop(victim_idx)
         if victim_block.is_null:
             return False
 
-        blocks[victim_idx] = self.block_pool.null_block
         self.block_pool.free_blocks([victim_block])
+        if request_id in self.num_cached_block:
+            self.num_cached_block[request_id] = min(
+                self.num_cached_block[request_id],
+                len(blocks),
+            )
         self.paged_eviction_state.record_eviction(request_id)
         self.paged_eviction_state.remove_request_block_score(request_id, victim_idx)
         return True
@@ -609,15 +634,14 @@ class SingleTypeKVCacheManager(ABC):
         num_blocks_to_evict = len(logical_block_indices) - policy.budget_blocks
         victim_indices = sorted(
             logical_block_indices,
-            key=lambda idx: scores.get(idx, 0.0),
+            key=lambda idx: scores.get(idx, float("inf")),
         )[:num_blocks_to_evict]
 
         victim_blocks = []
-        for victim_idx in victim_indices:
-            victim_block = blocks[victim_idx]
+        for victim_idx in sorted(victim_indices, reverse=True):
+            victim_block = blocks.pop(victim_idx)
             if victim_block.is_null:
                 continue
-            blocks[victim_idx] = self.block_pool.null_block
             victim_blocks.append(victim_block)
             self.paged_eviction_state.record_eviction(request_id)
             self.paged_eviction_state.remove_request_block_score(
@@ -630,6 +654,11 @@ class SingleTypeKVCacheManager(ABC):
             return False
 
         self.block_pool.free_blocks(victim_blocks)
+        if request_id in self.num_cached_block:
+            self.num_cached_block[request_id] = min(
+                self.num_cached_block[request_id],
+                len(blocks),
+            )
         return True
 
     def _select_active_kv_victims(

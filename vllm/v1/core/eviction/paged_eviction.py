@@ -231,13 +231,24 @@ class PagedEvictionPolicy:
                 budget_blocks=self.budget_blocks,
             )
 
-        # evict the lowest-scoring page/block
-        # missing scores default to 0.0 making unscored blocks maximally evictable
+        # Evict the lowest-scoring page/block. Missing scores must not look
+        # maximally evictable: score collection can legitimately skip blocks
+        # whose KV layout is unsupported by the scorer, and treating those as
+        # zero repeatedly selects arbitrary pages instead of the paper's
+        # K/V-norm victim.
         victim_idx = min(
             logical_block_indices,
-            key=lambda idx: scores_by_logical_block_idx.get(idx, 0.0),
+            key=lambda idx: scores_by_logical_block_idx.get(idx, float("inf")),
         )
-        victim_score = scores_by_logical_block_idx.get(victim_idx, 0.0)
+        victim_score = scores_by_logical_block_idx.get(victim_idx)
+        if victim_score is None:
+            return PagedEvictionDecision(
+                request_id=request_id,
+                victim_logical_block_idx=None,
+                victim_score=None,
+                num_blocks_before=blocks_before,
+                budget_blocks=self.budget_blocks,
+            )
 
         return PagedEvictionDecision(
             request_id=request_id,

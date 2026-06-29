@@ -74,6 +74,10 @@ class InputBatch:
     input_ids: torch.Tensor
     # [num_tokens_after_padding]
     positions: torch.Tensor
+    # Positions used only for KV-cache slot mapping. This may differ from
+    # `positions` when active KV eviction compacts retained KV tokens while
+    # model/RoPE positions remain absolute.
+    kv_positions: torch.Tensor
 
     # [total_num_logits]
     logits_indices: torch.Tensor
@@ -151,6 +155,7 @@ class InputBatch:
             is_prefilling_np=np.zeros(num_reqs, dtype=np.bool_),
             input_ids=input_ids,
             positions=positions,
+            kv_positions=positions,
             logits_indices=logits_indices,
             cu_num_logits=cu_num_logits,
             cu_num_logits_np=cu_num_logits_np,

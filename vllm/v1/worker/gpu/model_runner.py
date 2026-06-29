@@ -476,6 +476,122 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         return token_scores.mean(dim=1)
 
+    def _get_paged_eviction_kv_stores(
+        self,
+        kv_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if kv_cache.ndim >= 5 and kv_cache.shape[1] == 2:
+            return kv_cache[:, 0], kv_cache[:, 1]
+        if kv_cache.ndim >= 5 and kv_cache.shape[0] == 2:
+            return kv_cache[0], kv_cache[1]
+        return None
+
+    def _compact_paged_eviction_prefill(
+        self,
+        block_table_row: np.ndarray,
+        prefill_len: int,
+    ) -> bool:
+        policy = self.cache_config.active_kv_eviction_policy
+        budget_tokens = self.cache_config.active_kv_eviction_cache_budget_tokens
+        if policy != "paged" or budget_tokens is None:
+            return False
+
+        block_size = self.cache_config.block_size
+        budget_blocks = budget_tokens // block_size
+        retain_tokens = budget_blocks * block_size
+        if retain_tokens <= 0 or prefill_len <= retain_tokens:
+            return False
+
+        num_prompt_blocks = cdiv(prefill_len, block_size)
+        if num_prompt_blocks > len(block_table_row):
+            return False
+
+        src_block_ids = []
+        src_offsets = []
+        for token_idx in range(prefill_len):
+            block_id = int(block_table_row[token_idx // block_size])
+            if block_id <= 0:
+                return False
+            src_block_ids.append(block_id)
+            src_offsets.append(token_idx % block_size)
+
+        dst_block_ids = []
+        dst_offsets = []
+        for token_idx in range(retain_tokens):
+            block_id = int(block_table_row[token_idx // block_size])
+            if block_id <= 0:
+                return False
+            dst_block_ids.append(block_id)
+            dst_offsets.append(token_idx % block_size)
+
+        src_blocks = torch.tensor(src_block_ids, dtype=torch.long, device=self.device)
+        src_offsets_t = torch.tensor(src_offsets, dtype=torch.long, device=self.device)
+        dst_blocks = torch.tensor(dst_block_ids, dtype=torch.long, device=self.device)
+        dst_offsets_t = torch.tensor(dst_offsets, dtype=torch.long, device=self.device)
+
+        score_sum = torch.zeros(prefill_len, dtype=torch.float32, device=self.device)
+        score_count = 0
+        for kv_cache in self.kv_caches:
+            if (
+                not isinstance(kv_cache, torch.Tensor)
+                or not kv_cache.is_floating_point()
+            ):
+                continue
+            stores = self._get_paged_eviction_kv_stores(kv_cache)
+            if stores is None:
+                continue
+            k_store, v_store = stores
+            if k_store.ndim >= 2 and k_store.shape[1] == block_size:
+                pass
+            elif k_store.ndim >= 3 and k_store.shape[2] == block_size:
+                k_store = k_store.movedim(2, 1)
+                v_store = v_store.movedim(2, 1)
+            else:
+                continue
+            k_tokens = k_store[src_blocks, src_offsets_t].float()
+            v_tokens = v_store[src_blocks, src_offsets_t].float()
+            k_flat = k_tokens.reshape(prefill_len, -1)
+            v_flat = v_tokens.reshape(prefill_len, -1)
+            score_sum += torch.linalg.vector_norm(v_flat, dim=-1) / (
+                torch.linalg.vector_norm(k_flat, dim=-1) + 1e-6
+            )
+            score_count += 1
+
+        if score_count == 0:
+            return False
+
+        scores = score_sum / score_count
+        keep_indices = torch.topk(
+            scores, retain_tokens, largest=True, sorted=False
+        ).indices
+        keep_indices = keep_indices.sort().values
+        keep_src_blocks = src_blocks[keep_indices]
+        keep_src_offsets = src_offsets_t[keep_indices]
+
+        for kv_cache in self.kv_caches:
+            if (
+                not isinstance(kv_cache, torch.Tensor)
+                or not kv_cache.is_floating_point()
+            ):
+                continue
+            stores = self._get_paged_eviction_kv_stores(kv_cache)
+            if stores is None:
+                continue
+            k_store, v_store = stores
+            if k_store.ndim >= 2 and k_store.shape[1] == block_size:
+                pass
+            elif k_store.ndim >= 3 and k_store.shape[2] == block_size:
+                k_store = k_store.movedim(2, 1)
+                v_store = v_store.movedim(2, 1)
+            else:
+                continue
+            k_values = k_store[keep_src_blocks, keep_src_offsets].clone()
+            v_values = v_store[keep_src_blocks, keep_src_offsets].clone()
+            k_store[dst_blocks, dst_offsets_t] = k_values
+            v_store[dst_blocks, dst_offsets_t] = v_values
+
+        return True
+
     def _compute_paged_eviction_block_scores(
         self,
         input_batch: InputBatch,
@@ -489,14 +605,35 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         block_table_cpu = block_table.cpu().numpy()
         logical_block_ids: dict[str, list[tuple[int, int]]] = {}
         unique_block_ids: set[int] = set()
+        compacted_prefill_scores: dict[str, dict[int, float]] = {}
         for batch_idx, req_id in enumerate(input_batch.req_ids):
             req_state_idx = int(input_batch.idx_mapping_np[batch_idx])
-            num_computed_tokens = (
-                int(self.req_states.num_computed_tokens_np[req_state_idx])
-                + int(input_batch.num_scheduled_tokens[batch_idx])
+            previous_num_computed = int(
+                self.req_states.num_computed_tokens_np[req_state_idx]
             )
-            num_full_blocks = num_computed_tokens // self.cache_config.block_size
+            num_scheduled_tokens = int(input_batch.num_scheduled_tokens[batch_idx])
+            num_computed_tokens = (
+                previous_num_computed + num_scheduled_tokens
+            )
+            prefill_len = int(self.req_states.prefill_len.np[req_state_idx])
             row = block_table_cpu[batch_idx]
+            if (
+                previous_num_computed < prefill_len <= num_computed_tokens
+                and self._compact_paged_eviction_prefill(row, prefill_len)
+            ):
+                num_prompt_blocks = cdiv(prefill_len, self.cache_config.block_size)
+                budget_blocks = (
+                    self.cache_config.active_kv_eviction_cache_budget_tokens
+                    // self.cache_config.block_size
+                )
+                compacted_prefill_scores[req_id] = {
+                    logical_idx: 1.0
+                    if logical_idx < budget_blocks
+                    else -1.0
+                    for logical_idx in range(num_prompt_blocks)
+                }
+                continue
+            num_full_blocks = num_computed_tokens // self.cache_config.block_size
             block_ids = [
                 (logical_idx, int(block_id))
                 for logical_idx, block_id in enumerate(
@@ -509,7 +646,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 unique_block_ids.update(block_id for _, block_id in block_ids)
 
         if not unique_block_ids:
-            return None
+            return compacted_prefill_scores or None
 
         unique_block_ids = sorted(unique_block_ids)
         block_ids_tensor = torch.tensor(
@@ -544,9 +681,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if score_count[block_id] > 0
         }
         if not block_scores:
-            return None
+            return compacted_prefill_scores or None
 
-        result: dict[str, dict[int, float]] = {}
+        result: dict[str, dict[int, float]] = dict(compacted_prefill_scores)
         for req_id, block_ids in logical_block_ids.items():
             scores_by_logical_block = {
                 logical_idx: block_scores[block_id]
@@ -954,6 +1091,40 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.input_buffers.seq_lens,
         )
         seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
+        kv_positions = self.input_buffers.positions[:num_tokens_after_padding]
+
+        if self.cache_config.active_kv_eviction_policy == "paged":
+            active_num_computed_np = np.zeros(num_reqs_padded, dtype=np.int32)
+            block_size = self.cache_config.block_size
+            block_counts = self.block_tables.num_blocks.np[0]
+            for batch_idx in range(num_reqs):
+                req_state_idx = int(idx_mapping_np[batch_idx])
+                abs_num_computed = int(
+                    self.req_states.num_computed_tokens_np[req_state_idx]
+                )
+                active_blocks = int(block_counts[req_state_idx])
+                if active_blocks == 0:
+                    active_num_computed = 0
+                else:
+                    block_offset = abs_num_computed % block_size
+                    if block_offset == 0:
+                        active_num_computed = active_blocks * block_size
+                    else:
+                        active_num_computed = (
+                            max(active_blocks - 1, 0) * block_size + block_offset
+                        )
+                active_num_computed_np[batch_idx] = active_num_computed
+                seq_lens[batch_idx] = (
+                    active_num_computed + int(num_scheduled_tokens[batch_idx])
+                )
+                start = query_start_loc_np[batch_idx]
+                end = query_start_loc_np[batch_idx + 1]
+                kv_positions[start:end] = torch.arange(
+                    active_num_computed,
+                    active_num_computed + end - start,
+                    dtype=kv_positions.dtype,
+                    device=self.device,
+                )
 
         dcp_local_seq_lens = None
         if self.use_dcp:
@@ -1011,6 +1182,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             is_prefilling_np=is_prefilling_np,
             input_ids=self.input_buffers.input_ids[:num_tokens_after_padding],
             positions=self.input_buffers.positions[:num_tokens_after_padding],
+            kv_positions=kv_positions,
             logits_indices=logits_indices,
             cu_num_logits=cu_num_logits,
             cu_num_logits_np=cu_num_logits_np,
@@ -1030,7 +1202,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         slot_mappings = self.block_tables.compute_slot_mappings(
             input_batch.idx_mapping,
             input_batch.query_start_loc,
-            input_batch.positions,
+            input_batch.kv_positions,
             num_tokens_padded=input_batch.num_tokens_after_padding,
         )
         return block_tables, slot_mappings
