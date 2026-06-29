@@ -30,7 +30,11 @@ ShareGPT example usage:
 
 import dataclasses
 import json
+import os
 import random
+import shutil
+import subprocess
+import threading
 import time
 from statistics import mean, quantiles
 
@@ -44,6 +48,11 @@ try:
     from vllm.tokenizers import get_tokenizer
 except ImportError:
     from backend_request_func import get_tokenizer
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 PROMPT = "You are a helpful assistant in recognizes the content of tables in markdown format. Here is a table as fellows. You need to answer my question about the table.\n# Table\n|Opening|Opening|Sl. No.|Film|Cast|Director|Music Director|Notes|\n|----|----|----|----|----|----|----|----|\n|J A N|9|1|Agni Pushpam|Jayabharathi, Kamalahasan|Jeassy|M. K. Arjunan||\n|J A N|16|2|Priyamvada|Mohan Sharma, Lakshmi, KPAC Lalitha|K. S. Sethumadhavan|V. Dakshinamoorthy||\n|J A N|23|3|Yakshagaanam|Madhu, Sheela|Sheela|M. S. Viswanathan||\n|J A N|30|4|Paalkkadal|Sheela, Sharada|T. K. Prasad|A. T. Ummer||\n|F E B|5|5|Amma|Madhu, Srividya|M. Krishnan Nair|M. K. Arjunan||\n|F E B|13|6|Appooppan|Thikkurissi Sukumaran Nair, Kamal Haasan|P. Bhaskaran|M. S. Baburaj||\n|F E B|20|7|Srishti|Chowalloor Krishnankutty, Ravi Alummoodu|K. T. Muhammad|M. S. Baburaj||\n|F E B|20|8|Vanadevatha|Prem Nazir, Madhubala|Yusufali Kechery|G. Devarajan||\n|F E B|27|9|Samasya|Madhu, Kamalahaasan|K. Thankappan|Shyam||\n|F E B|27|10|Yudhabhoomi|K. P. Ummer, Vidhubala|Crossbelt Mani|R. K. Shekhar||\n|M A R|5|11|Seemantha Puthran|Prem Nazir, Jayabharathi|A. B. Raj|M. K. Arjunan||\n|M A R|12|12|Swapnadanam|Rani Chandra, Dr. Mohandas|K. G. George|Bhaskar Chandavarkar||\n|M A R|19|13|Thulavarsham|Prem Nazir, sreedevi, Sudheer|N. Sankaran Nair|V. Dakshinamoorthy||\n|M A R|20|14|Aruthu|Kaviyoor Ponnamma, Kamalahasan|Ravi|G. Devarajan||\n|M A R|26|15|Swimming Pool|Kamal Haasan, M. G. Soman|J. Sasikumar|M. K. Arjunan||\n\n# Question\nWhat' s the content in the (1,1) cells\n"  # noqa: E501
 
@@ -67,12 +76,10 @@ class Request:
 def sample_tokens(tokenizer: PreTrainedTokenizerBase, length: int) -> list[int]:
     vocab = tokenizer.get_vocab()
     all_special_ids = set(tokenizer.all_special_ids)
+    token_ids = sorted(v for v in vocab.values() if v not in all_special_ids)
 
     # Remove the special tokens.
-    return random.choices(
-        [v for v in vocab.values() if v not in all_special_ids],
-        k=length,
-    )
+    return random.choices(token_ids, k=length)
 
 
 def sample_requests_from_dataset(
@@ -289,7 +296,201 @@ def compute_int_stats(values: list[int]) -> dict:
     }
 
 
+def _mean_or_none(values: list[float]) -> float | None:
+    return mean(values) if values else None
+
+
+def _max_or_none(values: list[float]) -> float | None:
+    return max(values) if values else None
+
+
+def summarize_resource_samples(samples: list[dict]) -> dict:
+    if not samples:
+        return {}
+
+    cpu_percent = [
+        sample["cpu_percent"]
+        for sample in samples
+        if sample.get("cpu_percent") is not None
+    ]
+    process_rss_mb = [
+        sample["process_rss_mb"]
+        for sample in samples
+        if sample.get("process_rss_mb") is not None
+    ]
+    system_mem_percent = [
+        sample["system_mem_percent"]
+        for sample in samples
+        if sample.get("system_mem_percent") is not None
+    ]
+    gpu_util_percent = [
+        gpu["utilization_gpu_percent"]
+        for sample in samples
+        for gpu in sample.get("gpus", [])
+        if gpu.get("utilization_gpu_percent") is not None
+    ]
+    gpu_mem_used_mb = [
+        gpu["memory_used_mb"]
+        for sample in samples
+        for gpu in sample.get("gpus", [])
+        if gpu.get("memory_used_mb") is not None
+    ]
+
+    return {
+        "num_samples": len(samples),
+        "cpu_percent_mean": _mean_or_none(cpu_percent),
+        "cpu_percent_max": _max_or_none(cpu_percent),
+        "process_rss_mb_mean": _mean_or_none(process_rss_mb),
+        "process_rss_mb_max": _max_or_none(process_rss_mb),
+        "system_mem_percent_mean": _mean_or_none(system_mem_percent),
+        "system_mem_percent_max": _max_or_none(system_mem_percent),
+        "gpu_util_percent_mean": _mean_or_none(gpu_util_percent),
+        "gpu_util_percent_max": _max_or_none(gpu_util_percent),
+        "gpu_mem_used_mb_mean": _mean_or_none(gpu_mem_used_mb),
+        "gpu_mem_used_mb_max": _max_or_none(gpu_mem_used_mb),
+    }
+
+
+class ResourceMonitor:
+    def __init__(self, interval_s: float) -> None:
+        self.interval_s = interval_s
+        self.samples: list[dict] = []
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._process = psutil.Process(os.getpid()) if psutil is not None else None
+        self._has_nvidia_smi = shutil.which("nvidia-smi") is not None
+        visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        self._visible_devices = {
+            device.strip() for device in visible_devices.split(",") if device.strip()
+        }
+
+    def start(self) -> None:
+        if self.interval_s <= 0:
+            return
+        if self._process is not None:
+            self._process.cpu_percent(interval=None)
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(self.interval_s * 2, 1.0))
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            self.samples.append(self._collect_sample())
+            self._stop_event.wait(self.interval_s)
+
+    def _collect_sample(self) -> dict:
+        sample = {
+            "timestamp_s": time.time(),
+            "cpu_percent": None,
+            "process_rss_mb": None,
+            "process_vms_mb": None,
+            "system_mem_percent": None,
+            "system_mem_used_mb": None,
+            "system_mem_total_mb": None,
+            "gpus": [],
+        }
+
+        if psutil is not None and self._process is not None:
+            try:
+                processes = [self._process] + self._process.children(recursive=True)
+                cpu_percent = 0.0
+                rss_bytes = 0
+                vms_bytes = 0
+                for process in processes:
+                    try:
+                        cpu_percent += process.cpu_percent(interval=None)
+                        memory = process.memory_info()
+                        rss_bytes += memory.rss
+                        vms_bytes += memory.vms
+                    except psutil.Error:
+                        continue
+
+                system_mem = psutil.virtual_memory()
+                sample.update(
+                    {
+                        "cpu_percent": cpu_percent,
+                        "process_rss_mb": rss_bytes / (1024**2),
+                        "process_vms_mb": vms_bytes / (1024**2),
+                        "system_mem_percent": system_mem.percent,
+                        "system_mem_used_mb": system_mem.used / (1024**2),
+                        "system_mem_total_mb": system_mem.total / (1024**2),
+                    }
+                )
+            except psutil.Error:
+                pass
+
+        if self._has_nvidia_smi:
+            sample["gpus"] = self._collect_gpu_samples()
+
+        return sample
+
+    def _collect_gpu_samples(self) -> list[dict]:
+        query = (
+            "index,uuid,utilization.gpu,utilization.memory,"
+            "memory.used,memory.total,power.draw"
+        )
+        cmd = [
+            "nvidia-smi",
+            f"--query-gpu={query}",
+            "--format=csv,noheader,nounits",
+        ]
+        try:
+            output = subprocess.check_output(
+                cmd,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=2,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return []
+
+        gpus = []
+        for line in output.strip().splitlines():
+            fields = [field.strip() for field in line.split(",")]
+            if len(fields) != 7:
+                continue
+            if self._visible_devices and (
+                fields[0] not in self._visible_devices
+                and fields[1] not in self._visible_devices
+            ):
+                continue
+            gpus.append(
+                {
+                    "index": _parse_int(fields[0]),
+                    "uuid": fields[1],
+                    "utilization_gpu_percent": _parse_float(fields[2]),
+                    "utilization_memory_percent": _parse_float(fields[3]),
+                    "memory_used_mb": _parse_float(fields[4]),
+                    "memory_total_mb": _parse_float(fields[5]),
+                    "power_draw_w": _parse_float(fields[6]),
+                }
+            )
+        return gpus
+
+
+def _parse_float(value: str) -> float | None:
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def _parse_int(value: str) -> int | None:
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
 def main(args):
+    t_script_start = time.perf_counter()
+    phase_timings_s: dict[str, float] = {}
+
+    t0 = time.perf_counter()
     tokenizer = get_tokenizer(args.model, trust_remote_code=True)
     input_length_range = tuple(map(int, args.input_length_range.split(":")))
     random.seed(args.seed)
@@ -315,6 +516,7 @@ def main(args):
             fixed_output_len=args.output_len,
             prefix_len=args.prefix_len,
         )
+    phase_timings_s["tokenizer_and_sampling_s"] = time.perf_counter() - t0
 
     prompt_lens = [req.prompt_len for req in filtered_requests]
     print(f"Sampled {len(filtered_requests)} requests.")
@@ -322,7 +524,9 @@ def main(args):
     print(f"  P50 input len: {sorted(prompt_lens)[len(prompt_lens) // 2]}")
 
     engine_args = EngineArgs.from_cli_args(args)
+    t0 = time.perf_counter()
     llm = LLM.from_engine_args(engine_args)
+    phase_timings_s["engine_init_s"] = time.perf_counter() - t0
 
     sampling_params = SamplingParams(
         temperature=0,
@@ -331,14 +535,21 @@ def main(args):
         detokenize=not args.disable_detokenize,
     )
 
+    resource_monitor = ResourceMonitor(args.resource_sample_interval_s)
+    resource_monitor.start()
+
     # Warm-up: send all prompts once to fill the cache (not measured).
     if args.warmup_rounds > 0:
         print(f"Warming up ({args.warmup_rounds} round(s))...")
         warmup_prompts = repeat_and_sort_requests(
             filtered_requests, repeat_count=args.warmup_rounds, sort=args.sort
         )
+        t0 = time.perf_counter()
         llm.generate(warmup_prompts, sampling_params=sampling_params)
+        phase_timings_s["warmup_s"] = time.perf_counter() - t0
         print("Warm-up done.")
+    else:
+        phase_timings_s["warmup_s"] = 0.0
 
     # Measurement phase: send one request at a time to get per-request timing.
     measure_prompts = repeat_and_sort_requests(
@@ -349,6 +560,9 @@ def main(args):
     t_batch_start = time.perf_counter()
     per_request = run_requests_individually(llm, measure_prompts, sampling_params)
     t_batch_end = time.perf_counter()
+    resource_monitor.stop()
+    phase_timings_s["measurement_s"] = t_batch_end - t_batch_start
+    phase_timings_s["script_total_s"] = time.perf_counter() - t_script_start
 
     latencies_ms = [r["e2e_ms"] for r in per_request]
     output_tokens_per_request = [r["output_tokens"] for r in per_request]
@@ -371,6 +585,7 @@ def main(args):
         total_cached_tokens / total_input_tokens if total_input_tokens else None
     )
     output_token_stats = compute_int_stats(output_tokens_per_request)
+    resource_summary = summarize_resource_samples(resource_monitor.samples)
 
     print("\n=== Results ===")
     print(f"  Prefix eviction   : {args.eviction_policy}")
@@ -381,6 +596,15 @@ def main(args):
     print(f"  E2E latency P99   : {stats['p99_ms']:.1f} ms")
     print(f"  E2E latency mean  : {stats['mean_ms']:.1f} ms")
     print(f"  Throughput        : {throughput_tok_s:.1f} tok/s")
+    if resource_summary:
+        print(
+            "  GPU util mean     : "
+            f"{resource_summary.get('gpu_util_percent_mean')} %"
+        )
+        print(
+            "  CPU util mean     : "
+            f"{resource_summary.get('cpu_percent_mean')} %"
+        )
 
     hit_latencies = [r["e2e_ms"] for r in per_request if r["cached_tokens"] > 0]
     miss_latencies = [r["e2e_ms"] for r in per_request if r["cached_tokens"] == 0]
@@ -433,6 +657,7 @@ def main(args):
             "total_output_tokens": total_output_tokens,
             "total_input_tokens": total_input_tokens,
             "wall_time_s": wall_time_s,
+            "phase_timings_s": phase_timings_s,
             "per_request_latency_ms": latencies_ms,
             "per_request_output_tokens": output_tokens_per_request,
             "time_to_first_token_ms": ttft_stats.get("mean_ms"),
@@ -450,6 +675,9 @@ def main(args):
             "per_request_ttft_ms": ttft_ms,
             "per_request_itl_ms": itl_ms,
             "per_request_tpot_ms": tpot_ms,
+            "resource_sample_interval_s": args.resource_sample_interval_s,
+            "resource_summary": resource_summary,
+            "resource_samples": resource_monitor.samples,
         }
         with open(args.output_json, "w") as f:
             json.dump(result, f, indent=2)
@@ -524,6 +752,15 @@ def create_argument_parser():
         type=str,
         default=None,
         help="Path to write JSON results file.",
+    )
+    parser.add_argument(
+        "--resource-sample-interval-s",
+        type=float,
+        default=1.0,
+        help=(
+            "Seconds between CPU, memory, and GPU utilization samples. "
+            "Set to 0 to disable resource sampling."
+        ),
     )
 
     parser = EngineArgs.add_cli_args(parser)
