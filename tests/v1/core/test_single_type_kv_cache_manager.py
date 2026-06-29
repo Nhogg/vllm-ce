@@ -14,9 +14,14 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     ChunkedLocalAttentionManager,
+    FullAttentionManager,
     SlidingWindowManager,
 )
-from vllm.v1.kv_cache_interface import ChunkedLocalAttentionSpec, SlidingWindowSpec
+from vllm.v1.kv_cache_interface import (
+    ChunkedLocalAttentionSpec,
+    FullAttentionSpec,
+    SlidingWindowSpec,
+)
 
 pytestmark = pytest.mark.cpu_test
 
@@ -42,6 +47,112 @@ def get_chunked_local_attention_manager(
         kv_cache_group_id=0,
         max_admission_blocks_per_request=10**9,
     )
+
+
+def get_full_attention_manager(full_attention_spec, block_pool, enable_caching=True):
+    return FullAttentionManager(
+        full_attention_spec,
+        block_pool=block_pool,
+        enable_caching=enable_caching,
+        kv_cache_group_id=0,
+        max_admission_blocks_per_request=10**9,
+    )
+
+
+def test_paged_eviction_decode_removes_victim_page_from_active_table():
+    block_size = 2
+    full_attention_spec = FullAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=100, enable_caching=False, hash_block_size=block_size
+    )
+    manager = get_full_attention_manager(
+        full_attention_spec, block_pool, enable_caching=False
+    )
+    manager.enable_paged_eviction(cache_budget_tokens=4)
+
+    request_id = "req"
+    blocks = [block_pool.blocks[i] for i in range(1, 5)]
+    block_pool.touch(blocks)
+    manager.req_to_blocks[request_id] = blocks.copy()
+    manager.set_paged_eviction_block_scores(
+        request_id,
+        {
+            0: 3.0,
+            1: 1.0,
+            2: 2.0,
+            3: 0.5,
+        },
+    )
+
+    changed = manager.apply_paged_eviction(
+        request_id,
+        num_computed_tokens=4 * block_size,
+    )
+
+    assert changed
+    assert [block.block_id for block in manager.req_to_blocks[request_id]] == [
+        1,
+        3,
+        4,
+    ]
+    assert all(
+        not block.is_null for block in manager.req_to_blocks[request_id]
+    )
+    assert blocks[1].ref_cnt == 0
+
+
+def test_paged_prefill_eviction_compacts_to_budget_pages():
+    block_size = 2
+    full_attention_spec = FullAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=100, enable_caching=False, hash_block_size=block_size
+    )
+    manager = get_full_attention_manager(
+        full_attention_spec, block_pool, enable_caching=False
+    )
+    manager.enable_paged_eviction(cache_budget_tokens=4)
+
+    request_id = "req"
+    blocks = [block_pool.blocks[i] for i in range(1, 6)]
+    block_pool.touch(blocks)
+    manager.req_to_blocks[request_id] = blocks.copy()
+    manager.set_paged_eviction_block_scores(
+        request_id,
+        {
+            0: 5.0,
+            1: 1.0,
+            2: 3.0,
+            3: 2.0,
+            4: 4.0,
+        },
+    )
+
+    changed = manager.apply_paged_prefill_eviction(
+        request_id,
+        num_computed_tokens=5 * block_size,
+    )
+
+    assert changed
+    assert [block.block_id for block in manager.req_to_blocks[request_id]] == [
+        1,
+        5,
+    ]
+    assert all(
+        not block.is_null for block in manager.req_to_blocks[request_id]
+    )
+    assert blocks[1].ref_cnt == 0
+    assert blocks[2].ref_cnt == 0
+    assert blocks[3].ref_cnt == 0
 
 
 def test_chunked_local_attention_possible_cached_prefix():
