@@ -162,6 +162,19 @@ class Worker(WorkerBase):
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
 
+        # Experimental geometric KV-cache eviction (Option A). Inert unless the
+        # additional_config["geo_kv"] block is provided. Parsing here validates
+        # the experiment flags early and confirms the config reached the worker.
+        from vllm.v1.geo_kv import GeoKVConfig
+
+        self.geo_kv_config = GeoKVConfig.from_vllm_config(vllm_config)
+        if self.geo_kv_config.enabled:
+            logger.info(
+                "[geo_kv] experiment enabled (rank %s): %s",
+                rank,
+                self.geo_kv_config.summary(),
+            )
+
     def sleep(self, level: int = 1) -> None:
         free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
 
