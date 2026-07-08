@@ -249,3 +249,16 @@ vllm/grpc/vllm_engine_pb2.pyi
 
 # Ignore generated cpu headers 
 csrc/cpu/cpu_attn_dispatch_generated.h
+
+# Outputs
+/archive_runs/
+/pbs_logs/
+/data/
+/results/
+/analysis/
+/agent_notes.md
+/plan.md
+/progress_report.md
+*.o[0-9]*
+*.e[0-9]*
+
