@@ -139,6 +139,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # zeroing (e.g. hybrid models with fp8 KV cache).
         self.kv_block_zeroer: KVBlockZeroer | None = None
 
+        # Experimental geometric KV-cache eviction (Option A); inert by default.
+        # The prefill scorer is created in initialize_kv_cache() once the KV
+        # cache tensors exist.
+        from vllm.v1.geo_kv import GeoKVConfig
+
+        self.geo_kv_config = GeoKVConfig.from_vllm_config(vllm_config)
+        self.geo_prefill_scorer = None
+        # Mask-only block eviction (Option A, Milestone 1); created in
+        # initialize_kv_cache() when an active_eviction mode is selected.
+        self.geo_eviction_policy = None
+        self.geo_evicted_blocks: torch.Tensor | None = None
+        self.geo_flex_builder_cls: type | None = None
+
         self.vocab_size = self.model_config.get_vocab_size()
         self.max_model_len = self.model_config.max_model_len
         self.max_num_tokens = self.scheduler_config.max_num_batched_tokens
@@ -477,6 +490,114 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
 
+        if self.geo_kv_config.is_score_only:
+            self._init_geo_prefill_scorer(kv_caches_dict)
+        if self.geo_kv_config.active_eviction:
+            self._init_geo_eviction(kv_caches_dict)
+
+    def _init_geo_prefill_scorer(self, kv_caches_dict: dict[str, Any]) -> None:
+        """Create the geometric prefill scorer (Option A, score_only mode).
+
+        Read-only: reads K from the paged KV cache after prefill and writes
+        per-(layer, kv_head) redundancy stats. Single-GPU only, bf16 KV cache.
+        """
+        if self.parallel_config.world_size > 1:
+            logger.warning(
+                "[geo_kv] score_only supports single-GPU (TP=PP=1) only; "
+                "scorer disabled (world_size=%d).",
+                self.parallel_config.world_size,
+            )
+            return
+        if self.cache_config.cache_dtype != "auto":
+            logger.warning(
+                "[geo_kv] score_only disabled: quantized KV cache (%s) is not "
+                "supported for K-vector scoring.",
+                self.cache_config.cache_dtype,
+            )
+            return
+        from vllm.v1.geo_kv.prefill_scorer import PrefillScorer
+
+        self.geo_prefill_scorer = PrefillScorer(
+            self.geo_kv_config,
+            kv_caches_dict,
+            self.kv_cache_config.kv_cache_groups,
+            self.model_config.model,
+            self.device,
+        )
+
+    def _init_geo_eviction(self, kv_caches_dict: dict[str, Any]) -> None:
+        """Create the mask-only block-eviction policy (Option A, Milestone 1).
+
+        Fails closed with an actionable error if the run cannot support faithful,
+        RoPE-safe mid-sequence masking: the FlexAttention backend is required,
+        CUDA graphs must be off (eager), and the KV cache must be single-GPU and
+        unquantized so V-vector scoring is exact.
+        """
+        from vllm.v1.attention.backends.flex_attention import (
+            FlexAttentionMetadataBuilder,
+        )
+        from vllm.v1.geo_kv.eviction_policy import EvictionPolicy
+
+        if not self.model_config.enforce_eager:
+            raise ValueError(
+                "[geo_kv] active_eviction requires enforce_eager=True; "
+                "Milestone 1 runs eager (CUDA graphs are not yet supported)."
+            )
+        if self.parallel_config.world_size > 1:
+            raise ValueError(
+                "[geo_kv] active_eviction supports single-GPU (TP=PP=1) only; "
+                f"got world_size={self.parallel_config.world_size}."
+            )
+        if self.cache_config.cache_dtype != "auto":
+            raise ValueError(
+                "[geo_kv] active_eviction requires an unquantized (auto) KV "
+                f"cache; got cache_dtype={self.cache_config.cache_dtype!r}."
+            )
+        for groups in self.attn_groups:
+            for g in groups:
+                builder = g.get_metadata_builder()
+                if not isinstance(builder, FlexAttentionMetadataBuilder):
+                    raise ValueError(
+                        "[geo_kv] active_eviction requires the FlexAttention "
+                        "backend; launch with "
+                        "attention_backend='FLEX_ATTENTION' "
+                        "(e.g. --attention-backend FLEX_ATTENTION)."
+                    )
+        self.geo_flex_builder_cls = FlexAttentionMetadataBuilder
+
+        block_size = self.cache_config.block_size
+        max_pages = cdiv(self.max_model_len, block_size)
+        self.geo_evicted_blocks = torch.zeros(
+            self.max_num_reqs, max_pages, dtype=torch.bool, device=self.device
+        )
+        self.geo_eviction_policy = EvictionPolicy(
+            self.geo_kv_config,
+            kv_caches_dict,
+            self.kv_cache_config.kv_cache_groups,
+            self.geo_evicted_blocks,
+            block_size,
+            self.device,
+        )
+
+    def _stash_evicted_blocks(self, input_batch: InputBatch, dummy_run: bool) -> None:
+        """Hand the batch-ordered eviction mask to the FlexAttention builders.
+
+        ``geo_evicted_blocks`` is keyed by persistent request-state index; the
+        mask_mod reads it in batch order, so we reorder via ``idx_mapping`` (the
+        same transform vLLM applies to block tables). Dummy runs get no mask
+        (the builders fall back to the upstream path).
+        """
+        assert self.geo_evicted_blocks is not None
+        rows = None
+        if not dummy_run:
+            idx = input_batch.idx_mapping[: input_batch.num_reqs]
+            rows = self.geo_evicted_blocks.index_select(0, idx)
+        for groups in self.attn_groups:
+            for g in groups:
+                builder = g.get_metadata_builder()
+                if isinstance(builder, self.geo_flex_builder_cls):
+                    builder.pending_evicted_blocks = rows
+
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""
         self.kv_block_zeroer = KVBlockZeroer(
@@ -760,6 +881,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 max_tokens=sampling_params.max_tokens if sampling_params else 1,  # type: ignore[arg-type]
             )
             req_index = self.req_states.req_id_to_index[req_id]
+
+            if self.geo_evicted_blocks is not None:
+                # A finished request's slot is reused; clear its stale mask so
+                # the new request starts unmasked until its own end-of-prefill.
+                self.geo_evicted_blocks[req_index].zero_()
 
             if self.encoder_cache is not None:
                 self.encoder_cache.add_request(req_id, new_req_data.mm_features)
@@ -1192,6 +1318,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 slot_mappings, self.kv_cache_config
             )
             assert block_tables is not None
+            if self.geo_evicted_blocks is not None:
+                self._stash_evicted_blocks(input_batch, dummy_run)
             attn_metadata = self.model_state.prepare_attn(
                 input_batch,
                 batch_desc.cg_mode,
@@ -1299,6 +1427,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             aux_hidden_states=aux_hidden_states,
             finished_req_ids=finished_req_ids,
         )
+
+        # Option A (score_only): after the forward, K/V for this step's tokens
+        # are in the paged KV cache and the block tables are valid. Score any
+        # request whose prefill just completed. Read-only; no eviction.
+        if self.geo_prefill_scorer is not None and not dummy_run:
+            self.geo_prefill_scorer.on_step(input_batch, self.block_tables)
+        # Option A (mask-only eviction): after the forward, V for this step's
+        # tokens is in the paged cache. Decide eviction for any request whose
+        # prefill just completed; the mask takes effect on the next step.
+        if self.geo_eviction_policy is not None and not dummy_run:
+            self.geo_eviction_policy.on_step(input_batch, self.block_tables)
 
         if not self.is_last_pp_rank:
             # Non-last PP rank: return IntermediateTensors for sending.
@@ -1502,6 +1641,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def shutdown(self) -> None:
         """Release GPU tensors (model weights, KV caches, workspace) so that
         memory is reclaimable when running in the same process."""
+        if getattr(self, "geo_prefill_scorer", None) is not None:
+            self.geo_prefill_scorer.close()
+        if getattr(self, "geo_eviction_policy", None) is not None:
+            self.geo_eviction_policy.close()
         torch.accelerator.synchronize()
         if hasattr(self, "kv_caches"):
             self.kv_caches.clear()
