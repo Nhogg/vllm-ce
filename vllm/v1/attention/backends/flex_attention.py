@@ -403,6 +403,10 @@ class FlexAttentionMetadata:
     sliding_window: int | None = None
     mm_prefix_range: dict[int, list[tuple[int, int]]] | None = None
     block_sparsity_hint: BlockSparsityHint | None = None
+    # Experimental geo_kv eviction (mask-only): (num_reqs, max_pages) bool
+    # tensor where True hides that logical block from attention. None keeps the
+    # upstream behavior exactly (default).
+    evicted_blocks: torch.Tensor | None = None
 
     @cached_property
     def logical_block_ids(self):
@@ -460,6 +464,35 @@ class FlexAttentionMetadata:
         """
         assert self.doc_ids is not None
 
+        if self.evicted_blocks is None:
+
+            def final_mask_mod(
+                b: torch.Tensor,
+                h: torch.Tensor,
+                q_idx: torch.Tensor,
+                physical_kv_idx: torch.Tensor,
+            ) -> torch.Tensor:
+                (is_valid, logical_q_idx, logical_kv_idx) = (
+                    self._convert_physical_to_logical(
+                        self.doc_ids, q_idx, physical_kv_idx
+                    )
+                )
+                return is_valid & self.logical_mask_mod(
+                    b, h, logical_q_idx, logical_kv_idx
+                )
+
+            return final_mask_mod
+
+        # geo_kv mask-only eviction: additionally hide whole logical blocks that
+        # were flagged for this request. Indexing is by *logical* block, so RoPE
+        # and the block table are untouched. The clamp keeps the gather in-bounds
+        # for invalid lanes (logical_block_idx == -1 -> logical_kv_idx < 0); the
+        # trailing & is_valid then discards them, so the clamp never changes a
+        # real result.
+        evicted = self.evicted_blocks
+        block_size = self.block_size
+        max_pages = evicted.shape[1]
+
         def final_mask_mod(
             b: torch.Tensor,
             h: torch.Tensor,
@@ -469,7 +502,14 @@ class FlexAttentionMetadata:
             (is_valid, logical_q_idx, logical_kv_idx) = (
                 self._convert_physical_to_logical(self.doc_ids, q_idx, physical_kv_idx)
             )
-            return is_valid & self.logical_mask_mod(b, h, logical_q_idx, logical_kv_idx)
+            q_req = self.doc_ids[q_idx]
+            blk = (logical_kv_idx // block_size).clamp(0, max_pages - 1)
+            keep = ~evicted[q_req, blk]
+            return (
+                is_valid
+                & keep
+                & self.logical_mask_mod(b, h, logical_q_idx, logical_kv_idx)
+            )
 
         return final_mask_mod
 
@@ -807,6 +847,12 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
         self.persistent_physical_to_logical = None
         self.persistent_kv_indices = None
 
+        # Experimental geo_kv eviction (mask-only). The runner sets
+        # pending_evicted_blocks each step when active; None keeps the upstream
+        # behavior. The persistent buffer is allocated lazily (CUDA-graph safe).
+        self.pending_evicted_blocks: torch.Tensor | None = None
+        self.persistent_evicted_blocks: torch.Tensor | None = None
+
     @staticmethod
     def _get_block_sizes(
         attn_cfg,
@@ -924,6 +970,20 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
             else causal_mask_mod
         )
 
+        evicted_blocks = None
+        if self.pending_evicted_blocks is not None:
+            if self.persistent_evicted_blocks is None:
+                max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
+                self.persistent_evicted_blocks = torch.zeros(
+                    max_num_seqs,
+                    cdiv(self.max_model_len, self.block_size),
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+            evicted_blocks = copy_to_persistent(
+                self.persistent_evicted_blocks, self.pending_evicted_blocks
+            )
+
         out = FlexAttentionMetadata(
             causal=common_attn_metadata.causal,
             logical_mask_mod=logical_mask_mod,
@@ -957,6 +1017,7 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
             persistent_kv_indices=self.persistent_kv_indices,
             persistent_kv_num_blocks=self.persistent_kv_num_blocks,
             persistent_doc_ids=self.persistent_doc_ids,
+            evicted_blocks=evicted_blocks,
         )
 
         # Pre-build block_mask so it is ready before CUDA graph capture.
