@@ -592,6 +592,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if not dummy_run:
             idx = input_batch.idx_mapping[: input_batch.num_reqs]
             rows = self.geo_evicted_blocks.index_select(0, idx)
+            # When nothing is evicted this step (rate 0, or before any request's
+            # prefill has completed), hand back None so the builders use the
+            # exact upstream mask kernel. FlexAttention compiles the mask_mod
+            # into the kernel, so a logically-inert extra term still perturbs
+            # the output at the ~1e-6 level; short-circuiting keeps the
+            # no-eviction path byte-identical to upstream and zero-overhead. The
+            # .any() device sync is acceptable under eager Milestone 1.
+            if not bool(rows.any()):
+                rows = None
         for groups in self.attn_groups:
             for g in groups:
                 builder = g.get_metadata_builder()
