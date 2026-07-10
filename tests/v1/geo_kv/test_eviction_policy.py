@@ -11,12 +11,15 @@ v_redundancy policy drops first.
 import pytest
 import torch
 
+from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
 from vllm.v1.geo_kv.config import GeoKVConfig
 from vllm.v1.geo_kv.eviction_policy import (
     aggregate_layer_scores,
     select_evicted_blocks,
 )
 from vllm.v1.geo_kv.scoring import block_anchors, block_joint_redundancy
+from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 
 def test_select_rate_zero_is_all_false():
@@ -136,3 +139,101 @@ def test_duplicated_v_blocks_are_evicted_first():
     assert int(mask.sum()) == 1
     evicted = [i for i in range(B) if bool(mask[i])]
     assert evicted[0] in (1, 2)
+
+
+def _make_manager(num_blocks: int = 32, block_size: int = 16):
+    """Build a real FullAttentionManager over a real BlockPool (CPU-only)."""
+    spec = FullAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.float16,
+    )
+    pool = BlockPool(
+        num_gpu_blocks=num_blocks,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    mgr = FullAttentionManager(
+        kv_cache_spec=spec,
+        block_pool=pool,
+        enable_caching=True,
+        kv_cache_group_id=0,
+        scheduler_block_size=block_size,
+    )
+    return mgr, pool
+
+
+def _own_blocks(mgr, pool, req_id, n, cached_idxs=()):
+    """Give ``req_id`` ``n`` freshly-allocated blocks (ref_cnt==1 each).
+
+    Blocks at ``cached_idxs`` get a non-None hash so free_blocks_at routes them
+    through the cached (append) branch; the rest stay uncached (prepend branch).
+    """
+    blocks = pool.get_new_blocks(n)
+    for i in cached_idxs:
+        # free_blocks_at only checks ``block_hash is None``; set the backing
+        # field directly to avoid building a real BlockHashWithGroupId.
+        blocks[i]._block_hash = object()
+    mgr.req_to_blocks[req_id] = blocks
+    return blocks
+
+
+def test_free_blocks_at_nulls_interior_and_returns_count():
+    mgr, pool = _make_manager()
+    _own_blocks(mgr, pool, "r0", 6, cached_idxs=(1,))
+    free_before = pool.get_num_free_blocks()
+
+    freed = mgr.free_blocks_at("r0", [1, 3])
+
+    assert freed == 2
+    assert mgr.req_to_blocks["r0"][1].is_null
+    assert mgr.req_to_blocks["r0"][3].is_null
+    assert not mgr.req_to_blocks["r0"][0].is_null
+    assert not mgr.req_to_blocks["r0"][2].is_null
+    # Freed backing returned to the pool; length preserved (null substitution).
+    assert pool.get_num_free_blocks() == free_before + 2
+    assert len(mgr.req_to_blocks["r0"]) == 6
+
+
+def test_free_blocks_at_protects_tail_and_out_of_bounds():
+    mgr, pool = _make_manager()
+    _own_blocks(mgr, pool, "r0", 4)
+    free_before = pool.get_num_free_blocks()
+
+    # index 3 == tail (n-1); 99 and -1 are OOB -> all skipped.
+    freed = mgr.free_blocks_at("r0", [3, 99, -1])
+
+    assert freed == 0
+    assert not any(b.is_null for b in mgr.req_to_blocks["r0"])
+    assert pool.get_num_free_blocks() == free_before
+
+
+def test_free_blocks_at_skips_already_null():
+    mgr, pool = _make_manager()
+    _own_blocks(mgr, pool, "r0", 5)
+
+    assert mgr.free_blocks_at("r0", [1]) == 1
+    assert mgr.free_blocks_at("r0", [1]) == 0  # second attempt is a no-op
+
+
+def test_free_blocks_at_unknown_request_is_noop():
+    mgr, pool = _make_manager()
+    free_before = pool.get_num_free_blocks()
+
+    assert mgr.free_blocks_at("ghost", [0, 1]) == 0
+    assert "ghost" not in mgr.req_to_blocks  # .get() must not resurrect an entry
+    assert pool.get_num_free_blocks() == free_before
+
+
+def test_free_blocks_at_uncached_freed_first_for_reuse():
+    mgr, pool = _make_manager()
+    blocks = _own_blocks(mgr, pool, "r0", 8, cached_idxs=(1,))
+    uncached = blocks[4]  # block_hash is None -> prepend branch
+
+    freed = mgr.free_blocks_at("r0", [1, 4])  # 1 cached (append), 4 scratch (prepend)
+
+    assert freed == 2
+    # prepend=True puts the scratch block at the front of the free queue,
+    # so the next allocation hands it back first.
+    assert pool.get_new_blocks(1)[0] is uncached
