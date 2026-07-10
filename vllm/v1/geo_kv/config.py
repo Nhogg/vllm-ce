@@ -112,6 +112,10 @@ class GeoKVConfig:
     eviction_policy: str = "v_redundancy"
     # Seed for the "random" policy so a run is reproducible.
     eviction_seed: int = 0
+    # When True, evicted blocks are physically freed back into the block pool
+    # reclaiming GPU memory. Requires an active_eviction mode. When False,
+    # behavior is mask-only
+    physical_reclaim: bool = False
 
     # Output location for score_only artifacts (CSV/JSON). Optional.
     output_dir: str | None = None
@@ -211,6 +215,12 @@ class GeoKVConfig:
 
         if self.eviction_rate is not None and not (0.0 <= self.eviction_rate <= 1.0):
             raise ValueError("geo_kv.eviction_rate must be in [0, 1]")
+
+        if self.physical_reclaim and not self.active_eviction:
+            raise ValueError(
+                "geo_kv.physical_reclaim=True requires an active_eviction "
+                "experiment_mode"
+            )
 
         if self.total_page_cap is not None and self.total_page_cap <= 0:
             raise ValueError("geo_kv.total_page_cap must be a positive integer")
