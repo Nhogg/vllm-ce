@@ -179,12 +179,24 @@ class EvictionPolicy:
         )
 
     # -- per-step entry point ----------------------------------------------
-    def on_step(self, input_batch: InputBatch, block_tables: Any) -> None:
-        """Decide eviction for any request whose prefill completed this step."""
+    def on_step(
+        self, input_batch: InputBatch, block_tables: Any
+    ) -> dict[str, list[int]]:
+        """Decide eviction for any request whose prefill completed this step.
+
+        Returns:
+            Mapping {req_id: freed_logical_block_indices} for prefills that
+            completed this step. Populated only when config.physical_reclaim is
+            set.
+        """
         finished = self._finished_prefill_requests(input_batch)
-        for _batch_i, req_index, prompt_len in finished:
-            self._evict_request(req_index, prompt_len, block_tables)
+        freed: dict[str, list[int]] = {}
+        for batch_i, req_index, prompt_len in finished:
+            evicted = self._evict_request(req_index, prompt_len, block_tables)
+            if evicted:
+                freed[input_batch.req_ids[batch_i]] = evicted
         self._num_requests_evicted += len(finished)
+        return freed
 
     def _finished_prefill_requests(
         self, input_batch: InputBatch
@@ -206,7 +218,7 @@ class EvictionPolicy:
     # -- per-request eviction decision -------------------------------------
     def _evict_request(
         self, req_index: int, prompt_len: int, block_tables: Any
-    ) -> None:
+    ) -> list[int]:
         cfg = self.config
         per_layer: list[torch.Tensor] = []
         count = 0
@@ -224,7 +236,7 @@ class EvictionPolicy:
             valid = block_valid_lens(prompt_len, c, v.shape[1], v.device)
             per_layer.append(block_joint_redundancy(block_anchors(v, valid)))
         if count < 2 or not per_layer:
-            return
+            return []
 
         stacked = torch.stack(per_layer, dim=0)  # (num_sampled, count)
         scores = aggregate_layer_scores(
@@ -239,6 +251,12 @@ class EvictionPolicy:
             cfg.eviction_seed,
         )
         self.evicted_store[req_index, :count].copy_(mask.to(self.evicted_store.device))
+        if not cfg.physical_reclaim:
+            return []
+        # The store row was all-False before this write, so every True here is
+        # newly evicted. These are logical block indices the scheduler will
+        # physically free
+        return torch.nonzero(mask).flatten().tolist()
 
     def close(self) -> None:
         logger.info(

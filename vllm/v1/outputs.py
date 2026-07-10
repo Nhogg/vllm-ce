@@ -279,6 +279,9 @@ class ModelRunnerOutput:
     # its slot buffer via ``slot_buffer[slot_mapping] = routing_data``.
     # ``None`` when ``enable_return_routed_experts`` is off.
     routed_experts: RoutedExpertsLists | None = None
+    # req_id -> logical KV-block indices the GeoKV eviction policy physically
+    # freed this step. The scheduler returns their backing to the block pool.
+    geo_freed_blocks: dict[str, list[int]] | None = None
 
     @staticmethod
     def with_kv_conn_output_only(
