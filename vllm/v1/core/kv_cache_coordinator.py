@@ -305,9 +305,9 @@ class KVCacheCoordinator(ABC):
 
     def free_evicted_blocks(self, request_id: str, logical_indices: list[int]) -> int:
         """Free GeoKV-evicted blocks of a running request."""
-        assert len(self.single_type_managers) == , (
-                "geo_kv physical_reclaim supports a single KV-cache group only"
-                )
+        assert len(self.single_type_managers) == (
+            "geo_kv physical_reclaim supports a single KV-cache group only"
+        )
         return self.single_type_managers[0].free_blocks_at(request_id, logical_indices)
 
     def get_blocks(self, request_id: str) -> tuple[list[KVCacheBlock], ...]:

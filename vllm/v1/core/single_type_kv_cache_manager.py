@@ -518,17 +518,17 @@ class SingleTypeKVCacheManager(ABC):
         Returns:
             The number of blocks actually returned to the pool.
         """
-        blocks =- self.req_to_blocks.get(request_id)
+        blocks = self.req_to_blocks.get(request_id)
         if not blocks:
             return 0
         n = len(blocks)
         removed_cached: list[KVCacheBlock] = []
         removed_uncached: list[KVCacheBlock] = []
         for i in logical_indices:
-            if i < 0 or i >= n or i == n - 1: # bounds; never free tail indicator
+            if i < 0 or i >= n or i == n - 1:  # bounds; never free tail indicator
                 continue
             blk = blocks[i]
-            if blk = self._null_block: # already freed
+            if blk.is_null:  # already freed
                 continue
             if blk.block_hash is None:
                 removed_uncached.append(blk)
@@ -538,11 +538,10 @@ class SingleTypeKVCacheManager(ABC):
 
         # Mirror remove_skipped_blocks: cached blocks keep best-effort
         # prefix value (append), scratch blocks become the next allocation
-        # candidates (prepend). 
+        # candidates (prepend).
         self.block_pool.free_blocks(removed_cached)
         self.block_pool.free_blocks(removed_uncached, prepend=True)
         return len(removed_cached) + len(removed_uncached)
-
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """
