@@ -458,6 +458,18 @@ class KVCacheManager:
         """
         self.coordinator.remove_skipped_blocks(request_id, total_computed_tokens)
 
+    def free_evicted_blocks(self, request_id: str, logical_indices: list[int]) -> int:
+        """Free GeoKV-evicted blocks of a running request back to the pool.
+
+        Args:
+            request_id: The running request ID.
+            logical_indices: Logical block positions to free.
+
+        Returns:
+            The number of blocks returned to the pool.
+        """
+        return self.coordinator.free_evicted_blocks(request_id, logical_indices)
+
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
 

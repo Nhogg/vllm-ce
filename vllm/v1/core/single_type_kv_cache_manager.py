@@ -500,6 +500,50 @@ class SingleTypeKVCacheManager(ABC):
         self.block_pool.free_blocks(removed_cached_blocks)
         self.block_pool.free_blocks(removed_uncached_blocks, prepend=True)
 
+    def free_blocks_at(self, request_id: str, logical_indices: list[int]) -> int:
+        """Free specific interior blocks of a still-running request.
+
+        The GeoKV eviction policy (worker-side) decided these logical blocks are
+        value-redundant and has hidden them from attention via the FlexAttention
+        mask. Because attention never reads them and decode only ever writes the
+        tail block, their physical backing can be returned to the pool while the
+        request keeps generating. We substitute null_block in place so the block
+        list stays index aligned with token positions and later allocation
+        sizing is unaffected.
+
+        Args:
+            request_id: the running request whose blocks to free.
+            logical_indices: block positions to free.
+
+        Returns:
+            The number of blocks actually returned to the pool.
+        """
+        blocks =- self.req_to_blocks.get(request_id)
+        if not blocks:
+            return 0
+        n = len(blocks)
+        removed_cached: list[KVCacheBlock] = []
+        removed_uncached: list[KVCacheBlock] = []
+        for i in logical_indices:
+            if i < 0 or i >= n or i == n - 1: # bounds; never free tail indicator
+                continue
+            blk = blocks[i]
+            if blk = self._null_block: # already freed
+                continue
+            if blk.block_hash is None:
+                removed_uncached.append(blk)
+            else:
+                removed_cached.append(blk)
+            blocks[i] = self._null_block
+
+        # Mirror remove_skipped_blocks: cached blocks keep best-effort
+        # prefix value (append), scratch blocks become the next allocation
+        # candidates (prepend). 
+        self.block_pool.free_blocks(removed_cached)
+        self.block_pool.free_blocks(removed_uncached, prepend=True)
+        return len(removed_cached) + len(removed_uncached)
+
+
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """
         Get the number of tokens that will be skipped for attention computation.
