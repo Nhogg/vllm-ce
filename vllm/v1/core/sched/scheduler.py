@@ -1364,6 +1364,13 @@ class Scheduler(SchedulerInterface):
                 num_scheduled_tokens,
             )
 
+        if model_runner_output.geo_freed_blocks:
+            # GeoKV physical reclamation (M2): the worker decided these logical
+            # blocks are value-redundant and masked them from attention; return
+            # their physical backing to the pool now. Safe because the M1 mask
+            # stays on, so the freed positions are never read again.
+            self._handle_geo_freed_blocks(model_runner_output.geo_freed_blocks)
+
         # Persist per-step routed experts into the scheduler-side slot
         # buffer (CPU->CPU fancy-index assign; ~few MB per step).
         # MUST precede the per-request routing reads below: stopped
@@ -2349,6 +2356,19 @@ class Scheduler(SchedulerInterface):
                 affected_req_ids.add(request.request_id)
 
         return affected_req_ids, total_affected_tokens, blocks_to_evict
+
+    def _handle_geo_freed_blocks(self, freed: dict[str, list[int]]) -> None:
+        """Return GeoKV-evicted interior blocks to the pool (Milestone 2).
+
+        Args:
+            freed: Mapping ``{req_id: logical_block_indices}`` reported by the
+                worker's eviction policy for prefills that completed this step.
+                Requests that finished or aborted this step are skipped; the
+                per-block tail/null guards live in ``free_blocks_at``.
+        """
+        for req_id, logical_indices in freed.items():
+            if req_id in self.requests:
+                self.kv_cache_manager.free_evicted_blocks(req_id, logical_indices)
 
     def _handle_invalid_blocks(
         self, invalid_block_ids: set[int], num_scheduled_tokens: dict[str, int]

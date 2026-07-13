@@ -563,6 +563,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         "attention_backend='FLEX_ATTENTION' "
                         "(e.g. --attention-backend FLEX_ATTENTION)."
                     )
+        if self.geo_kv_config.physical_reclaim:
+            from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+            groups = self.kv_cache_config.kv_cache_groups
+            if len(groups) != 1 or not isinstance(
+                groups[0].kv_cache_spec, FullAttentionSpec
+            ):
+                raise ValueError(
+                    "[geo_kv] physical_reclaim requires exactly one "
+                    "full-attention KV-cache group (the scheduler frees "
+                    "blocks by a single group's logical order); got "
+                    f"{len(groups)} group(s). Hybrid/SWA is out of scope."
+                )
+            if self.use_async_scheduling:
+                raise ValueError(
+                    "[geo_kv] physical_reclaim does not yet support async "
+                    "scheduling; relaunch with async scheduling disabled."
+                )
         self.geo_flex_builder_cls = FlexAttentionMetadataBuilder
 
         block_size = self.cache_config.block_size
@@ -1446,7 +1464,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # tokens is in the paged cache. Decide eviction for any request whose
         # prefill just completed; the mask takes effect on the next step.
         if self.geo_eviction_policy is not None and not dummy_run:
-            self.geo_eviction_policy.on_step(input_batch, self.block_tables)
+            geo_freed = self.geo_eviction_policy.on_step(
+                input_batch, self.block_tables
+            )
+            if geo_freed:
+                # Physical reclamation (M2): carry the freed logical block
+                # indices to sample_tokens so they ride out on the
+                # ModelRunnerOutput. Empty under plain M1 (mask-only) => the
+                # state's geo_freed_blocks stays None and nothing is freed.
+                self.execute_model_state = self.execute_model_state._replace(
+                    geo_freed_blocks=geo_freed
+                )
 
         if not self.is_last_pp_rank:
             # Non-last PP rank: return IntermediateTensors for sending.
@@ -1468,6 +1496,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states = self.execute_model_state.hidden_states
         aux_hidden_states = self.execute_model_state.aux_hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
+        geo_freed_blocks = self.execute_model_state.geo_freed_blocks
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -1520,6 +1549,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             req_id_to_index={req_id: i for i, req_id in enumerate(input_batch.req_ids)},
             sampled_token_ids=None,  # type: ignore
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
+            geo_freed_blocks=geo_freed_blocks,
         )
         # Start async output copy here so that it can overlap with speculator proposal.
         async_output = AsyncOutput(
@@ -1708,3 +1738,4 @@ class ExecuteModelState(NamedTuple):
     hidden_states: torch.Tensor | None
     aux_hidden_states: list[torch.Tensor] | None
     finished_req_ids: set[str]
+    geo_freed_blocks: dict[str, list[int]] | None = None
