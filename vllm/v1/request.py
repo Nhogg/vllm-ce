@@ -147,6 +147,13 @@ class Request:
 
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
+        # Tokens physically compactes out of this request's
+        # block table row. Always a whole-block multiple; 0
+        # until an end-of-prefill eviction shrinks the row,
+        # constant thereafter.
+        # Storage length (= num_computed_tokens - num_evicted_tokens)
+        # drives block-allocation sizing.
+        self.num_evicted_tokens = 0
         self.cache_salt: str | None = cache_salt
 
         # Multi-modal related
