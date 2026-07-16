@@ -124,6 +124,11 @@ class CachedRequestData:
     new_block_ids: list[tuple[list[int], ...] | None]
     num_computed_tokens: list[int]
     num_output_tokens: list[int]
+    # GeoKV M2c: {req_id: (packed_block_ids, num_evicted_tokens)} for requests
+    # whose block table was physically compacted this step. The worker replaces
+    # the row and sets the evicted offset before appending the step's new
+    # block(s). Empty under plain M1 (mask-only) or non-geo runs.
+    geo_compacted: dict[str, tuple[list[int], int]]
 
     # Version of dataclass repr with token IDs obfuscated.
     def anon_repr(self) -> str:
@@ -174,6 +179,7 @@ class CachedRequestData:
             new_block_ids=[],
             num_computed_tokens=[],
             num_output_tokens=[],
+            geo_compacted={},
         )
 
 

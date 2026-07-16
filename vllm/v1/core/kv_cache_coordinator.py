@@ -310,6 +310,17 @@ class KVCacheCoordinator(ABC):
         )
         return self.single_type_managers[0].free_blocks_at(request_id, logical_indices)
 
+    def compact_evicted_blocks(
+        self, request_id: str, logical_indices: list[int]
+    ) -> tuple[list[int], int] | None:
+        """Compact GeoKV-evicted blocks of a running request (M2c)."""
+        assert len(self.single_type_managers) == 1, (
+            "geo_kv physical_reclaim supports a single KV-cache group only"
+        )
+        return self.single_type_managers[0].compact_blocks_at(
+            request_id, logical_indices
+        )
+
     def get_blocks(self, request_id: str) -> tuple[list[KVCacheBlock], ...]:
         """
         Get the blocks for the request.

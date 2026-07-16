@@ -543,6 +543,62 @@ class SingleTypeKVCacheManager(ABC):
         self.block_pool.free_blocks(removed_uncached, prepend=True)
         return len(removed_cached) + len(removed_uncached)
 
+    def compact_blocks_at(
+        self, request_id: str, logical_indices: list[int]
+    ) -> tuple[list[int], int] | None:
+        """Physically compact a running request's block list.
+
+        Unlike free_blocks_at (which substitutes null_block to keep
+        the list index-aligned with token positions), this REMOVES the
+        evicted interior blocks and packs the survivors contiguously in ascending
+        original order, returning the freed physicals to the pool. Surviving values
+        keep their baked-in RoPE and their temporal order.
+
+        Only interior full blocks are ever evicted by the policy so the removed
+        count maps exactly to a whole-block token offset downstream.
+
+        Args:
+            request_id: the running request to compact.
+            logical_indices: interior block positions the policy evicted
+
+        Returns:
+            (rew_block_ids, num_evicted_blocks) where new_block_ids is the
+            full packed survivor row and num_evicted_blocks is how many whole blocks
+            were removed or None if nothing was compacted.
+        """
+        blocks = self.req_to_blocks.get(request_id)
+        if not blocks:
+            return None
+        n = len(blocks)
+        drop = {
+            i
+            for i in logical_indices
+            if 0 <= i < n and i != n - 1 and not blocks[i].is_null
+        }
+        if not drop:
+            return None
+
+        removed_cached: list[KVCacheBlock] = []
+        removed_uncached: list[KVCacheBlock] = []
+        survivors: list[KVCacheBlock] = []
+        for i, blk in enumerate(blocks):
+            if i in drop:
+                if blk.block_hash is None:
+                    removed_uncached.append(blk)
+                else:
+                    removed_cached.append(blk)
+            else:
+                survivors.append(blk)
+
+        # Mirror free_blocks_at's pooling policy: cached blocks keep best-effort
+        # prefix value (append), scratch blocks become next-alloc candidates.
+        self.block_pool.free_blocks(removed_cached)
+        self.block_pool.free_blocks(removed_uncached, prepend=True)
+
+        self.req_to_blocks[request_id] = survivors
+        new_block_ids = [b.block_id for b in survivors]
+        return new_block_ids, len(drop)
+
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """
         Get the number of tokens that will be skipped for attention computation.

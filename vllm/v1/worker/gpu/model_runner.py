@@ -955,14 +955,53 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Add new blocks and update num_computed_tokens for the existing requests.
         reqs = scheduler_output.scheduled_cached_reqs
         num_computed_tokens_np = self.req_states.num_computed_tokens_np
+        geo_compacted = getattr(reqs, "geo_compacted", None) or {}
         for req_id, num_computed_tokens, req_new_block_ids in zip(
             reqs.req_ids, reqs.num_computed_tokens, reqs.new_block_ids
         ):
             req_index = self.req_states.req_id_to_index[req_id]
             num_computed_tokens_np[req_index] = num_computed_tokens
+
+            # GeoKV M2c: apply physical compaction BEFORE this step's block
+            # append, so the new decode block(s) land at the compacted tail.
+            compaction = geo_compacted.get(req_id)
+            if compaction is not None:
+                packed_block_ids, num_evicted = compaction
+                # Replace the row with packed survivors (overwrite=True resets
+                # the row length to 0, then writes from index 0).
+                self.block_tables.append_block_ids(
+                    req_index, (packed_block_ids,), overwrite=True
+                )
+                # storage_seq_len = num_computed - num_evicted; RoPE positions
+                # stay at num_computed (uncompacted). Phase-2 kernels already
+                # subtract this offset (slot mapping, seq/pos lens, mask).
+                self.req_states.num_evicted_tokens_np[req_index] = num_evicted
+                self.req_states.num_evicted_tokens[
+                    req_index : req_index + 1
+                ].fill_(num_evicted)
+                # Switch mask-mode -> compaction-mode: zero the mask row so
+                # _stash_evicted_blocks' .any() short-circuits to the plain
+                # causal kernel over the now-shorter storage.
+                if self.geo_evicted_blocks is not None:
+                    self.geo_evicted_blocks[req_index].zero_()
+
             if req_new_block_ids is not None:
                 self.block_tables.append_block_ids(
                     req_index, req_new_block_ids, overwrite=False
+                )
+
+            if compaction is not None:
+                # Fail fast on a snapshot/delta desync: the compacted row length
+                # must equal the storage length the kernels assume,
+                # cdiv(num_computed - num_evicted, block_size).
+                bs = self.block_tables.block_sizes[0]  # single geo group
+                storage_len = num_computed_tokens - num_evicted
+                expected = (storage_len + bs - 1) // bs
+                actual = int(self.block_tables.num_blocks.np[0, req_index])
+                assert actual == expected, (
+                    f"GeoKV M2c row-size mismatch req={req_id}: block table has "
+                    f"{actual} blocks but storage_len={storage_len} needs "
+                    f"{expected} (bs={bs}). Snapshot/delta desync."
                 )
 
         # Update CPU num_computed_prefill_tokens.

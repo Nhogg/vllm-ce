@@ -154,6 +154,11 @@ class Scheduler(SchedulerInterface):
 
         # req_id -> Request
         self.requests: dict[str, Request] = {}
+        # GeoKV M2c: {req_id: (packed_block_ids, num_evicted_tokens)} staged by
+        # _handle_geo_freed_blocks when a running request's block table is
+        # physically compacted, drained into the next CachedRequestData so the
+        # worker replaces the row. Reset each step after draining.
+        self._geo_pending_compaction: dict[str, tuple[list[int], int]] = {}
         # Scheduling policy
         try:
             self.policy = SchedulingPolicy(self.scheduler_config.policy)
@@ -985,6 +990,7 @@ class Scheduler(SchedulerInterface):
         self._inflight_prefills.discard(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
+        request.num_evicted_tokens = 0  # GeoKV M2c: recompute drops compaction
         if request.spec_token_ids:
             request.spec_token_ids = []
         request.num_preemptions += 1
@@ -1132,6 +1138,20 @@ class Scheduler(SchedulerInterface):
                 req.num_output_tokens + req.num_output_placeholders
             )
 
+        # GeoKV M2c: drain block-table compactions staged since the last step.
+        # Deliver each to the worker on the first step its request is scheduled
+        # (a not-scheduled request allocates nothing, so deferring is safe and
+        # keeps the packed-survivor snapshot consistent with the block append).
+        # Entries for requests that finished before delivery are dropped.
+        geo_compacted: dict[str, tuple[list[int], int]] = {}
+        if self._geo_pending_compaction:
+            scheduled = set(req_ids)
+            for rid in list(self._geo_pending_compaction):
+                if rid in scheduled:
+                    geo_compacted[rid] = self._geo_pending_compaction.pop(rid)
+                elif rid not in self.requests:
+                    del self._geo_pending_compaction[rid]
+
         return CachedRequestData(
             req_ids=req_ids,
             resumed_req_ids=resumed_req_ids,
@@ -1140,6 +1160,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids=new_block_ids,
             num_computed_tokens=num_computed_tokens,
             num_output_tokens=num_output_tokens,
+            geo_compacted=geo_compacted,
         )
 
     def _try_schedule_encoder_inputs(
@@ -2332,6 +2353,7 @@ class Scheduler(SchedulerInterface):
                 marked_invalid_block = True
                 # Truncate the computed tokens at the first failed block
                 request.num_computed_tokens = idx * self.block_size
+                request.num_evicted_tokens = 0  # GeoKV M2c: recompute drops it
                 num_affected_tokens = (
                     req_num_computed_tokens - request.num_computed_tokens
                 )
@@ -2358,17 +2380,38 @@ class Scheduler(SchedulerInterface):
         return affected_req_ids, total_affected_tokens, blocks_to_evict
 
     def _handle_geo_freed_blocks(self, freed: dict[str, list[int]]) -> None:
-        """Return GeoKV-evicted interior blocks to the pool (Milestone 2).
+        """Physically compact GeoKV-evicted interior blocks (Milestone 2c).
+
+        Removes the evicted blocks from each running request's block list and
+        packs the survivors contiguously, then records the packed row and the
+        whole-block token offset so the next ``CachedRequestData`` carries them
+        to the worker (which replaces the row and sets ``num_evicted_tokens``).
+        RoPE positions stay uncompacted (``num_computed_tokens`` unchanged);
+        only physical storage / the block table shrink.
 
         Args:
             freed: Mapping ``{req_id: logical_block_indices}`` reported by the
                 worker's eviction policy for prefills that completed this step.
                 Requests that finished or aborted this step are skipped; the
-                per-block tail/null guards live in ``free_blocks_at``.
+                per-block tail/null guards live in ``compact_blocks_at``.
         """
         for req_id, logical_indices in freed.items():
-            if req_id in self.requests:
-                self.kv_cache_manager.free_evicted_blocks(req_id, logical_indices)
+            req = self.requests.get(req_id)
+            if req is None:
+                continue
+            result = self.kv_cache_manager.compact_evicted_blocks(
+                req_id, logical_indices
+            )
+            if result is None:
+                continue
+            new_block_ids, num_evicted_blocks = result
+            req.num_evicted_tokens += num_evicted_blocks * self.block_size
+            # Stage for the next CachedRequestData so the worker replaces the
+            # row and sets the evicted offset before this step's block append.
+            self._geo_pending_compaction[req_id] = (
+                new_block_ids,
+                req.num_evicted_tokens,
+            )
 
     def _handle_invalid_blocks(
         self, invalid_block_ids: set[int], num_scheduled_tokens: dict[str, int]

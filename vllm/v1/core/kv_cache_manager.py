@@ -372,6 +372,17 @@ class KVCacheManager:
             num_tokens_main_model + num_lookahead_tokens, self.max_model_len
         )
 
+        # GeoKV M2c: block SIZING follows compacted STORAGE length, not the
+        # (uncompacted) RoPE length. Compaction shrank req_to_blocks by the
+        # evicted whole-block count, but the token totals above stay rope-based;
+        # without this the per-step delta cdiv(num_tokens) - len(req_blocks)
+        # would re-allocate the evicted blocks every step. num_new_tokens (what
+        # gets computed) and the max_model_len clamp remain rope-based.
+        num_evicted_tokens = getattr(request, "num_evicted_tokens", 0)
+        if num_evicted_tokens:
+            num_tokens_main_model -= num_evicted_tokens
+            num_tokens_need_slot -= num_evicted_tokens
+
         # Free the blocks that are skipped during the attention computation
         # (e.g., tokens outside the sliding window).
         # We can do this even if we cannot schedule this request due to
@@ -469,6 +480,25 @@ class KVCacheManager:
             The number of blocks returned to the pool.
         """
         return self.coordinator.free_evicted_blocks(request_id, logical_indices)
+
+    def compact_evicted_blocks(
+        self, request_id: str, logical_indices: list[int]
+    ) -> tuple[list[int], int] | None:
+        """Compact a running request's row; returns (new_block_ids, n_blocks).
+
+        Physically removes the GeoKV-evicted interior blocks and packs the
+        survivors contiguously (vs :meth:`free_evicted_blocks`, which
+        null-substitutes to stay index-aligned). Returns ``None`` if nothing
+        was compacted.
+
+        Args:
+            request_id: The running request ID.
+            logical_indices: Logical block positions to compact out.
+
+        Returns:
+            ``(new_block_ids, num_evicted_blocks)`` or ``None``.
+        """
+        return self.coordinator.compact_evicted_blocks(request_id, logical_indices)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
