@@ -26,6 +26,11 @@ class InputBuffers:
             max_num_reqs + 1, dtype=torch.int32, device=device
         )
         self.seq_lens = torch.zeros(max_num_reqs, dtype=torch.int32, device=device)
+        # Compacted attention gather length. Equals seq_lens unless a
+        # request's block-table row has been physically compacted
+        self.storage_seq_lens = torch.zeros(
+            max_num_reqs, dtype=torch.int32, device=device
+        )
         # DCP: per-request local seq_lens buffer
         self.dcp_local_seq_lens = torch.zeros(
             max_num_reqs, dtype=torch.int32, device=device
@@ -63,8 +68,12 @@ class InputBatch:
     query_start_loc_np: np.ndarray
     # [num_reqs]
     seq_lens: torch.Tensor
+    # [num_reqs] Compacted attention seq_lens
+    storage_seq_lens: torch.Tensor
     # [num_reqs] CPU upper bound on seq_lens (see CommonAttentionMetadata).
     seq_lens_cpu_upper_bound: torch.Tensor
+    # [num_reqs] compacted cpu upper bound
+    storage_seq_lens_cpu_upper_bound: torch.Tensor
     # [num_reqs]
     dcp_local_seq_lens: torch.Tensor | None
     # [num_reqs]
@@ -155,7 +164,10 @@ class InputBatch:
             query_start_loc=query_start_loc,
             query_start_loc_np=query_start_loc_np,
             seq_lens=seq_lens,
+            # GeoKV M2c: dummy/capture batches are never compacted (storage == rope).
+            storage_seq_lens=seq_lens,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+            storage_seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             dcp_local_seq_lens=None,
             num_computed_tokens_np=np.zeros(num_reqs, dtype=np.int32),
             prefill_len_np=np.zeros(num_reqs, dtype=np.int32),
@@ -235,9 +247,11 @@ def prepare_prefill_inputs(
 def _prepare_pos_seq_lens_kernel(
     pos_ptr,
     seq_lens_ptr,
+    storage_seq_lens_ptr,  # GeoKV M2c
     idx_mapping_ptr,
     query_start_loc_ptr,
     num_computed_tokens_ptr,
+    num_evicted_tokens_ptr,  # GeoKV M2c: per-req compacted-out tokens
     max_num_reqs,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -249,10 +263,12 @@ def _prepare_pos_seq_lens_kernel(
             block = i + tl.arange(0, BLOCK_SIZE)
             mask = block < max_num_reqs
             tl.store(seq_lens_ptr + block, 0, mask=mask)
+            tl.store(storage_seq_lens_ptr + block, 0, mask=mask)
         return
 
     req_state_idx = tl.load(idx_mapping_ptr + req_id)
     num_computed_tokens = tl.load(num_computed_tokens_ptr + req_state_idx)
+    num_evicted_tokens = tl.load(num_evicted_tokens_ptr + req_state_idx)
 
     start = tl.load(query_start_loc_ptr + req_id)
     end = tl.load(query_start_loc_ptr + req_id + 1)
@@ -260,6 +276,9 @@ def _prepare_pos_seq_lens_kernel(
 
     seq_len = num_computed_tokens + query_len
     tl.store(seq_lens_ptr + req_id, seq_len)
+    # GeoKV M2c: attention walks the compacted storage length (== seq_len when
+    # nothing is evicted). RoPE positions below stay uncompacted.
+    tl.store(storage_seq_lens_ptr + req_id, seq_len - num_evicted_tokens)
 
     for i in tl.range(0, query_len, BLOCK_SIZE):
         block = i + tl.arange(0, BLOCK_SIZE)
@@ -272,8 +291,10 @@ def prepare_pos_seq_lens(
     idx_mapping: torch.Tensor,
     query_start_loc: torch.Tensor,
     num_computed_tokens: torch.Tensor,
+    num_evicted_tokens: torch.Tensor,  # GeoKV M2c
     pos: torch.Tensor,
     seq_lens: torch.Tensor,
+    storage_seq_lens: torch.Tensor,  # GeoKV M2c
 ) -> None:
     num_reqs = idx_mapping.shape[0]
     # NOTE(woosuk): We do +1 because the last thread block is used
@@ -281,9 +302,11 @@ def prepare_pos_seq_lens(
     _prepare_pos_seq_lens_kernel[(num_reqs + 1,)](
         pos,
         seq_lens,
+        storage_seq_lens,
         idx_mapping,
         query_start_loc,
         num_computed_tokens,
+        num_evicted_tokens,
         seq_lens.shape[0],
         BLOCK_SIZE=1024,
     )

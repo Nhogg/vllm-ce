@@ -172,7 +172,10 @@ class DefaultModelState(ModelState):
             num_tokens = input_batch.num_tokens
         query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
         max_query_len = input_batch.num_scheduled_tokens.max().item()
-        seq_lens_cpu_upper_bound = input_batch.seq_lens_cpu_upper_bound
+        # GeoKV M2c: attention walks the compacted storage length (== rope
+        # seq_lens when nothing is evicted). The prefill/decode discriminators
+        # keep the uncompacted input_batch.seq_lens.
+        seq_lens_cpu_upper_bound = input_batch.storage_seq_lens_cpu_upper_bound
         if for_capture:
             # Capture with worst-case max_seq_len so the graph is valid at any replay.
             max_seq_len = self.max_model_len
@@ -185,7 +188,7 @@ class DefaultModelState(ModelState):
             query_start_loc_gpu=input_batch.query_start_loc,
             query_start_loc_cpu=query_start_loc_cpu,
             max_query_len=max_query_len,
-            seq_lens=input_batch.seq_lens,
+            seq_lens=input_batch.storage_seq_lens,
             max_seq_len=max_seq_len,
             block_tables=block_tables,
             slot_mappings=slot_mappings,

@@ -66,6 +66,13 @@ class BlockTables:
             device=self.device,
         )
 
+        # GeoKV M2c: zero-offset fallback for callers with no compaction state
+        # (non-geo runs and the spec-decode draft path). Keeps slot mapping
+        # byte-identical to upstream when no request has been compacted.
+        self.zero_evicted_tokens = torch.zeros(
+            self.max_num_reqs, dtype=torch.int32, device=self.device
+        )
+
         self.init_block_table_layout_tensors()
 
     def _make_ptr_tensor(self, x: Iterable[torch.Tensor]) -> torch.Tensor:
@@ -147,7 +154,12 @@ class BlockTables:
         query_start_loc: torch.Tensor,
         positions: torch.Tensor,
         num_tokens_padded: int,
+        num_evicted_tokens: torch.Tensor | None = None,  # GeoKV M2c
     ) -> torch.Tensor:
+        # GeoKV M2c: absent offset (non-geo run or spec-decode draft path) means
+        # no request is compacted, so subtracting zeros is a no-op.
+        if num_evicted_tokens is None:
+            num_evicted_tokens = self.zero_evicted_tokens
         num_reqs = idx_mapping.shape[0]
         num_groups = self.num_kv_cache_groups
         _compute_slot_mappings_kernel[(num_groups, num_reqs + 1)](
@@ -155,6 +167,7 @@ class BlockTables:
             idx_mapping,
             query_start_loc,
             positions,
+            num_evicted_tokens,
             self.block_table_ptrs,
             self.block_table_strides,
             self.block_sizes_tensor,
@@ -225,7 +238,8 @@ def _compute_slot_mappings_kernel(
     max_num_tokens,
     idx_mapping,  # [num_reqs]
     query_start_loc,  # [num_reqs + 1]
-    pos,  # [num_tokens]
+    pos,  # [num_tokens]  (uncompacted RoPE positions)
+    num_evicted_tokens,  # GeoKV M2c: [max_num_reqs] per-req compacted-out tokens
     block_table_ptrs,  # [num_kv_cache_groups]
     block_table_strides,  # [num_kv_cache_groups]
     block_sizes,  # [num_kv_cache_groups]
@@ -258,11 +272,15 @@ def _compute_slot_mappings_kernel(
     block_size = tl.load(block_sizes + group_id)
 
     req_state_idx = tl.load(idx_mapping + batch_idx)
+    evicted = tl.load(num_evicted_tokens + req_state_idx)  # GeoKV M2c
     start_idx = tl.load(query_start_loc + batch_idx)
     end_idx = tl.load(query_start_loc + batch_idx + 1)
     for i in range(start_idx, end_idx, TRITON_BLOCK_SIZE):
         offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
         positions = tl.load(pos + offset, mask=offset < end_idx, other=0)
+        # GeoKV M2c: map the uncompacted RoPE position to its compacted storage
+        # slot. Keep padded lanes at 0 so the block-table load stays in-bounds.
+        positions = tl.where(offset < end_idx, positions - evicted, 0)
 
         block_indices = positions // (block_size * CP_SIZE)
         block_offsets = positions % (block_size * CP_SIZE)

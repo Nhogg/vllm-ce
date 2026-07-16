@@ -1065,10 +1065,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             idx_mapping,
             query_start_loc,
             self.req_states.num_computed_tokens.gpu,
+            self.req_states.num_evicted_tokens,
             self.input_buffers.positions,
             self.input_buffers.seq_lens,
+            self.input_buffers.storage_seq_lens,
         )
         seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
+        storage_seq_lens = self.input_buffers.storage_seq_lens[:num_reqs_padded]
 
         dcp_local_seq_lens = None
         if self.use_dcp:
@@ -1106,6 +1109,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             out=seq_lens_cpu_upper_bound_np[:num_reqs],
         )
         seq_lens_cpu_upper_bound = torch.from_numpy(seq_lens_cpu_upper_bound_np)
+        # GeoKV M2c: compacted CPU upper bound (drives attention max_seq_len).
+        num_evicted_tokens_np = self.req_states.num_evicted_tokens_np[idx_mapping_np]
+        storage_seq_lens_cpu_upper_bound_np = np.zeros(num_reqs_padded, dtype=np.int32)
+        np.subtract(
+            seq_lens_cpu_upper_bound_np[:num_reqs],
+            num_evicted_tokens_np,
+            out=storage_seq_lens_cpu_upper_bound_np[:num_reqs],
+        )
+        storage_seq_lens_cpu_upper_bound = torch.from_numpy(
+            storage_seq_lens_cpu_upper_bound_np
+        )
 
         max_seq_len_np = None
         if self.use_pp:
@@ -1127,7 +1141,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             query_start_loc=query_start_loc,
             query_start_loc_np=query_start_loc_np,
             seq_lens=seq_lens,
+            storage_seq_lens=storage_seq_lens,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+            storage_seq_lens_cpu_upper_bound=storage_seq_lens_cpu_upper_bound,
             dcp_local_seq_lens=dcp_local_seq_lens,
             num_computed_tokens_np=num_computed_tokens_np,
             prefill_len_np=prefill_len_np,
@@ -1157,6 +1173,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.query_start_loc,
             input_batch.positions,
             num_tokens_padded=input_batch.num_tokens_after_padding,
+            num_evicted_tokens=self.req_states.num_evicted_tokens,
         )
         return block_tables, slot_mappings
 
