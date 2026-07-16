@@ -581,17 +581,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     "[geo_kv] physical_reclaim does not yet support async "
                     "scheduling; relaunch with async scheduling disabled."
                 )
-        if self.cache_config.enable_prefix_caching:
-            raise ValueError(
-                "[geo_kv] physical_reclaim (block-table compaction is "
-                "incompatible with prefix caching, whihc indexes cached "
-                "blocks by uncompacted position; relaunch with "
-                "--no-enable-prefix-caching."
-            )
-        if self.speculative_config is not None:
-            raise ValueError(
-                "[geo_kv] physical_reclaim does not support speculative decoding"
-            )
+            if self.cache_config.enable_prefix_caching:
+                raise ValueError(
+                    "[geo_kv] physical_reclaim (block-table compaction) is "
+                    "incompatible with prefix caching, which indexes cached "
+                    "blocks by uncompacted position; relaunch with "
+                    "--no-enable-prefix-caching."
+                )
+            if self.speculative_config is not None:
+                raise ValueError(
+                    "[geo_kv] physical_reclaim does not support speculative "
+                    "decoding."
+                )
         self.geo_flex_builder_cls = FlexAttentionMetadataBuilder
 
         block_size = self.cache_config.block_size
