@@ -972,6 +972,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.block_tables.append_block_ids(
                     req_index, (packed_block_ids,), overwrite=True
                 )
+                # Fail fast on a snapshot/delta desync: BEFORE this step's block
+                # append, the packed survivor row must equal the compacted
+                # storage length the kernels assume, cdiv(num_computed -
+                # num_evicted, block_size). Checked here (not after the append)
+                # because the append legitimately adds this step's new decode
+                # block on top, which would make an after-check off by one on
+                # block-boundary-aligned prompts.
+                bs = self.block_tables.block_sizes[0]  # single geo group
+                storage_len = num_computed_tokens - num_evicted
+                expected = (storage_len + bs - 1) // bs
+                actual = int(self.block_tables.num_blocks.np[0, req_index])
+                assert actual == expected, (
+                    f"GeoKV M2c row-size mismatch req={req_id}: packed row has "
+                    f"{actual} blocks but storage_len={storage_len} needs "
+                    f"{expected} (bs={bs}). Snapshot/delta desync."
+                )
                 # storage_seq_len = num_computed - num_evicted; RoPE positions
                 # stay at num_computed (uncompacted). Phase-2 kernels already
                 # subtract this offset (slot mapping, seq/pos lens, mask).
@@ -988,20 +1004,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if req_new_block_ids is not None:
                 self.block_tables.append_block_ids(
                     req_index, req_new_block_ids, overwrite=False
-                )
-
-            if compaction is not None:
-                # Fail fast on a snapshot/delta desync: the compacted row length
-                # must equal the storage length the kernels assume,
-                # cdiv(num_computed - num_evicted, block_size).
-                bs = self.block_tables.block_sizes[0]  # single geo group
-                storage_len = num_computed_tokens - num_evicted
-                expected = (storage_len + bs - 1) // bs
-                actual = int(self.block_tables.num_blocks.np[0, req_index])
-                assert actual == expected, (
-                    f"GeoKV M2c row-size mismatch req={req_id}: block table has "
-                    f"{actual} blocks but storage_len={storage_len} needs "
-                    f"{expected} (bs={bs}). Snapshot/delta desync."
                 )
 
         # Update CPU num_computed_prefill_tokens.
