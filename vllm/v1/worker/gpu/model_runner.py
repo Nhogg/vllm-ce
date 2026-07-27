@@ -607,6 +607,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.geo_evicted_blocks,
             block_size,
             self.device,
+            self.req_states.num_evicted_tokens_np,
         )
 
     def _stash_evicted_blocks(self, input_batch: InputBatch, dummy_run: bool) -> None:
@@ -925,6 +926,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # A finished request's slot is reused; clear its stale mask so
                 # the new request starts unmasked until its own end-of-prefill.
                 self.geo_evicted_blocks[req_index].zero_()
+                if self.geo_eviction_policy is not None:
+                    # Clear the decoupled per-end decode band too (recycled slot).
+                    self.geo_eviction_policy.reset_request(req_index)
 
             if self.encoder_cache is not None:
                 self.encoder_cache.add_request(req_id, new_req_data.mm_features)
@@ -1535,6 +1539,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # prefill just completed; the mask takes effect on the next step.
         if self.geo_eviction_policy is not None and not dummy_run:
             geo_freed = self.geo_eviction_policy.on_step(input_batch, self.block_tables)
+            # Decode-time capacity eviction: for each decoding request that has
+            # regrown to capacity C, evict the most-redundant blocks down to the
+            # low watermark. Under physical_reclaim this returns freed logical
+            # block indices; a request is either prefilling or decoding on a
+            # given step, so the two maps never share a req_id. A no-op (empty)
+            # unless decode_evict_budget is configured / mask-only.
+            geo_freed_decode = self.geo_eviction_policy.on_decode_step(
+                input_batch, self.block_tables
+            )
+            if geo_freed_decode:
+                geo_freed = {**geo_freed, **geo_freed_decode}
             if geo_freed:
                 # Physical reclamation (M2): carry the freed logical block
                 # indices to sample_tokens so they ride out on the

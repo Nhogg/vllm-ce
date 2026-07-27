@@ -117,6 +117,43 @@ class GeoKVConfig:
     # behavior is mask-only
     physical_reclaim: bool = False
 
+    # -- Capacity-budget eviction with hysteresis (physical reclaim) --------
+    # Per-request capacity C on KV blocks, enforced with a low-watermark band.
+    # The cache is allowed to fill to C, then V-redundancy scoring physically
+    # frees the most-redundant interior blocks down to floor(watermark * C).
+    # This governs BOTH ends: at end of prefill (fill to C, evict to the
+    # watermark) and during decode (regrow to C, evict again). None disables it
+    # entirely (pure prefill-rate behavior, unchanged). The leading
+    # warmup_pages (sink) and the final block are always kept.
+    decode_evict_budget: int | None = None
+    # Low-watermark ratio: eviction targets floor(decode_evict_watermark *
+    # decode_evict_budget) blocks. The hysteresis gap (C down to watermark*C)
+    # bounds how often the O(C^2) scoring + compaction runs during decode.
+    decode_evict_watermark: float = 0.75
+    # Re-check the capacity only every N decode steps (throttle). A request only
+    # crosses a block boundary every block_size steps, so 1 is already cheap;
+    # larger values reduce scoring frequency further.
+    decode_evict_interval: int = 1
+
+    # -- Decoupled per-end targets, expressed as a fraction of prompt blocks --
+    # These decouple the two eviction ends so admission and decode can be tuned
+    # independently (e.g. strict admission + lenient decode). They are resolved
+    # per-request from that request's prompt block count P, so a single fraction
+    # is comparable across models / tasks / prompt lengths. Both are additive and
+    # independent: set either, both, or neither. When set they take precedence
+    # over the coupled ``decode_evict_budget`` path.
+    #
+    # ``prefill_evict_frac``: at end of prefill, retain ceil(f * P) prompt blocks
+    # (V-redundancy drops the rest). None disables admission eviction. f == 1.0 is
+    # inert (retain all).
+    prefill_evict_frac: float | None = None
+    # ``decode_evict_frac``: the decode capacity is C = ceil(f * P); when a
+    # decoding request regrows to C, the most-redundant interior blocks are
+    # evicted down to ceil(decode_evict_watermark * C). None disables decode
+    # eviction. Reuses ``decode_evict_watermark`` (band floor) and
+    # ``decode_evict_interval`` (throttle).
+    decode_evict_frac: float | None = None
+
     # Output location for score_only artifacts (CSV/JSON). Optional.
     output_dir: str | None = None
     run_id: str | None = None
@@ -226,6 +263,53 @@ class GeoKVConfig:
             raise ValueError("geo_kv.total_page_cap must be a positive integer")
         if self.warmup_pages is not None and self.warmup_pages < 0:
             raise ValueError("geo_kv.warmup_pages must be >= 0")
+        if self.decode_evict_budget is not None:
+            if self.decode_evict_budget < 1:
+                raise ValueError("geo_kv.decode_evict_budget must be >= 1")
+            if self.decode_evict_interval < 1:
+                raise ValueError("geo_kv.decode_evict_interval must be >= 1")
+            if not (0.0 < self.decode_evict_watermark < 1.0):
+                raise ValueError(
+                    "geo_kv.decode_evict_watermark must be in (0, 1) "
+                    "(the low-watermark fraction of decode_evict_budget)"
+                )
+            # eviction_policy selects WHICH blocks the band drops:
+            # v_redundancy (scored, the thesis), recency (oldest-first ==
+            # StreamingLLM baseline at matched memory), or random. All three are
+            # honored by select_evicted_to_budget, so no policy restriction here.
+            if not self.active_eviction:
+                raise ValueError(
+                    "geo_kv.decode_evict_budget requires an active_eviction "
+                    "experiment_mode"
+                )
+        # Decoupled fraction-of-prompt targets. Each is independent; when either
+        # is set it uses the same policy/mode requirements as the budget path.
+        for _name, _frac in (
+            ("prefill_evict_frac", self.prefill_evict_frac),
+            ("decode_evict_frac", self.decode_evict_frac),
+        ):
+            if _frac is None:
+                continue
+            if not (0.0 < _frac <= 1.0):
+                raise ValueError(f"geo_kv.{_name} must be in (0, 1]")
+            if self.eviction_policy != "v_redundancy":
+                raise ValueError(
+                    f"geo_kv.{_name} currently requires "
+                    "eviction_policy='v_redundancy' (the core thesis signal)"
+                )
+            if not self.active_eviction:
+                raise ValueError(
+                    f"geo_kv.{_name} requires an active_eviction experiment_mode"
+                )
+        if self.decode_evict_frac is not None and self.decode_evict_interval < 1:
+            raise ValueError("geo_kv.decode_evict_interval must be >= 1")
+        if self.decode_evict_frac is not None and not (
+            0.0 < self.decode_evict_watermark < 1.0
+        ):
+            raise ValueError(
+                "geo_kv.decode_evict_watermark must be in (0, 1) "
+                "(the low-watermark fraction of the decode capacity)"
+            )
         if not (0.0 < self.topk_frac <= 1.0):
             raise ValueError("geo_kv.topk_frac must be in (0, 1]")
         if self.token_sample_cap < 2:
