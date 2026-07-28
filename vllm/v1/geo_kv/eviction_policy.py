@@ -42,6 +42,7 @@ from vllm.v1.geo_kv.scoring import (
     block_anchors,
     block_joint_redundancy,
     block_valid_lens,
+    block_value_l2,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -85,7 +86,10 @@ def _choose_evicted(
     Returns:
         ``(k,)`` long tensor: the chosen block indices.
     """
-    if policy == "v_redundancy":
+    if policy in ("v_redundancy", "value_l2"):
+        # Both are scored policies: highest droppability first. v_redundancy
+        # scores by V-redundancy; value_l2 passes a negated value-L2 norm (so
+        # lowest-norm == highest droppability), computed in _score_request_blocks.
         local = scores.detach().to(device="cpu", dtype=torch.float32)[lo:hi]
         order = torch.argsort(local, descending=True)
         return evictable_t[order[:k]]
@@ -152,6 +156,7 @@ def select_evicted_to_budget(
     warmup_pages: int,
     policy: str = "v_redundancy",
     seed: int = 0,
+    tail_protect_frac: float | None = None,
 ) -> torch.Tensor:
     """Evict interior blocks down to a per-request budget under ``policy``.
 
@@ -174,6 +179,12 @@ def select_evicted_to_budget(
         warmup_pages: Number of leading blocks to always keep (sink).
         policy: ``"v_redundancy"``, ``"recency"``, or ``"random"``.
         seed: Seed for the ``"random"`` policy (reproducible).
+        tail_protect_frac: When set (>0), also protect the last
+            ``ceil(tail_protect_frac * num_blocks)`` blocks from eviction (a
+            recency floor over the prompt tail, where the LongBench question
+            lives). Clamped so enough interior blocks remain to still reach
+            ``budget`` -- memory stays matched. None/0.0 restores the pinned
+            v_redundancy window (no tail guard beyond the single anchor).
 
     Returns:
         ``(num_blocks,)`` bool tensor; True = evict (hide from attention).
@@ -183,12 +194,22 @@ def select_evicted_to_budget(
         return evict
     lo = max(int(warmup_pages), 0)
     hi = num_blocks - 1  # always keep the final block (decode anchor)
+    # Drop just enough to reach budget (bounded by the base evictable window).
+    k = min(num_blocks - budget, max(hi - lo, 0))
+    if k <= 0:
+        return evict
+    # Tail-protect (recency floor): pull ``hi`` in to shield the last M blocks.
+    # Clamp M so at least k evictable blocks remain -- we must still reach budget,
+    # so the guard never shrinks the window below what the budget cut requires.
+    if tail_protect_frac:
+        m = math.ceil(tail_protect_frac * num_blocks)
+        m = max(0, min(m, (hi - lo) - k))
+        hi -= m
     evictable = list(range(lo, hi))
     n = len(evictable)
     if n <= 0:
         return evict
-    # Drop just enough to reach budget, but never more than the evictable set.
-    k = min(num_blocks - budget, n)
+    k = min(k, n)
     if k <= 0:
         return evict
     evictable_t = torch.tensor(evictable, dtype=torch.long)
@@ -429,6 +450,7 @@ class EvictionPolicy:
             request holds fewer than two blocks (nothing to evict).
         """
         cfg = self.config
+        value_l2 = cfg.eviction_policy == "value_l2"
         per_layer: list[torch.Tensor] = []
         for layer_idx, layer_name, group_id in self.layers:
             if layer_idx not in self.sampled_layer_idxs:
@@ -441,7 +463,13 @@ class EvictionPolicy:
             )
             v = self.kv[layer_name][block_ids, 1]  # (c, block_size, H, D)
             valid = block_valid_lens(valid_len, c, v.shape[1], v.device)
-            per_layer.append(block_joint_redundancy(block_anchors(v, valid)))
+            if value_l2:
+                # Paged-Eviction baseline: drop lowest value-L2-norm blocks.
+                # Negate so higher == more droppable, matching the scored-policy
+                # convention consumed by argsort(descending) in _choose_evicted.
+                per_layer.append(-block_value_l2(v, valid))
+            else:
+                per_layer.append(block_joint_redundancy(block_anchors(v, valid)))
         if not per_layer:
             return None
         stacked = torch.stack(per_layer, dim=0)  # (num_sampled, count)
@@ -491,6 +519,7 @@ class EvictionPolicy:
                 int(cfg.warmup_pages or 0),
                 cfg.eviction_policy,
                 cfg.eviction_seed,
+                cfg.query_tail_protect_frac,
             )
             self.evicted_store[req_index, : scores.shape[0]].copy_(
                 mask.to(self.evicted_store.device)
@@ -522,6 +551,7 @@ class EvictionPolicy:
                 int(cfg.warmup_pages or 0),
                 cfg.eviction_policy,
                 cfg.eviction_seed,
+                cfg.query_tail_protect_frac,
             )
         else:
             mask = select_evicted_blocks(
@@ -650,6 +680,7 @@ class EvictionPolicy:
                 int(cfg.warmup_pages or 0),
                 cfg.eviction_policy,
                 cfg.eviction_seed,
+                cfg.query_tail_protect_frac,
             )
             if not bool(mask.any()):
                 return []
@@ -659,11 +690,11 @@ class EvictionPolicy:
             )
             return torch.nonzero(mask).flatten().tolist()
         # Mask-only A/B mode (no compaction ever lands to clear the row): never
-        # re-keep an already-hidden block. For v_redundancy, force its score high
-        # so scoring re-selects it; recency/random pick by index (oldest-k is a
-        # prefix, so previously-hidden oldest blocks stay chosen). The OR-merge
-        # then guarantees the store only ever gains True and stays at the
-        # watermark for every policy.
+        # re-keep an already-hidden block. For scored policies (v_redundancy,
+        # value_l2), force its score to +inf so scoring re-selects it;
+        # recency/random pick by index (oldest-k is a prefix, so previously-hidden
+        # oldest blocks stay chosen). The OR-merge then guarantees the store only
+        # ever gains True and stays at the watermark for every policy.
         prev = self.evicted_store[req_index, :count].to("cpu")
         if bool(prev.any()):
             scores = scores.detach().to(device="cpu", dtype=torch.float32).clone()
@@ -675,6 +706,7 @@ class EvictionPolicy:
             int(cfg.warmup_pages or 0),
             cfg.eviction_policy,
             cfg.eviction_seed,
+            cfg.query_tail_protect_frac,
         )
         merged = mask | prev
         if bool((merged & ~prev).any()):

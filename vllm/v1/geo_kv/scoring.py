@@ -302,6 +302,38 @@ def block_joint_redundancy(anchors: torch.Tensor) -> torch.Tensor:
     return sim.max(dim=1).values
 
 
+def block_value_l2(v_blocks: torch.Tensor, valid_lens: torch.Tensor) -> torch.Tensor:
+    """Per-block value-L2-norm score (the Paged-Eviction ``value_l2`` signal).
+
+    Replicates ``KVCachePruner.get_block_score`` from the Paged-Eviction fork
+    (``vllm/attention/kvcache_prunner.py``): score a block by the L2 norm of its
+    value vectors, averaged over KV heads and summed over the block's tokens ---
+    ``norm(V, p=2, dim=-1).mean(heads).sum(tokens)``. The fork ignores padding in
+    the final partial block; here we mask to a block's valid tokens, which is
+    strictly more correct and only differs on the last block.
+
+    A *high* norm means the block carries strong value signal, so Paged Eviction
+    drops the *lowest*-norm blocks. Callers negate this to obtain a droppability
+    score (higher == more droppable), matching the v_redundancy convention that
+    the budget selector's ``argsort(descending)`` consumes.
+
+    Args:
+        v_blocks: V vectors for a request's blocks at one layer, shape
+            ``(B, block_size, H, D)``.
+        valid_lens: ``(B,)`` int tensor of valid token counts per block.
+
+    Returns:
+        ``(B,)`` per-block value-L2-norm (magnitude; NOT yet negated).
+    """
+    B, S, _, _ = v_blocks.shape
+    device = v_blocks.device
+    v = v_blocks.to(torch.float32)
+    pos = torch.arange(S, device=device).view(1, S)
+    mask = (pos < valid_lens.view(B, 1)).to(torch.float32)  # (B, S)
+    per_tok = torch.norm(v, p=2, dim=-1).mean(dim=2)  # (B, S): mean over heads
+    return (per_tok * mask).sum(dim=1)  # (B,): sum over valid tokens
+
+
 def _apply_norm(units: torch.Tensor, mode: str, eps: float = 1e-6) -> torch.Tensor:
     """Return cosine-ready unit vectors for a normalization ``mode``.
 

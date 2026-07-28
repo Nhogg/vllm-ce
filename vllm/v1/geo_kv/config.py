@@ -40,8 +40,10 @@ HEAD_REDUNDANCY_STATS = ("max", "topk_mean", "percentile_90")
 BLOCK_SCORE_AGGREGATIONS = ("mean", "max", "topk_mean", "percentile_90")
 OVERFLOW_EVICTION_MODES = ("repeated_single",)
 # Milestone-1 (mask-only) eviction policies. v_redundancy is the thesis;
-# recency (drop-oldest) and random are the matched-count baselines.
-EVICTION_POLICIES = ("v_redundancy", "recency", "random")
+# recency (drop-oldest) and random are the matched-count baselines; value_l2 is
+# the Paged-Eviction baseline (drop lowest value-L2-norm blocks), ported into the
+# V1 capacity-band path for a matched-memory contrast against v_redundancy.
+EVICTION_POLICIES = ("v_redundancy", "recency", "random", "value_l2")
 # Mirror of scoring.NORM_VARIANTS, duplicated so config stays import-light
 # (no torch). Kept in sync by the norm_variants validation test.
 NORM_VARIANT_CHOICES = ("raw", "center_request", "whiten_request")
@@ -164,6 +166,15 @@ class GeoKVConfig:
     query_ema_beta: float | None = None
     query_alignment_weight: float | None = None
     enable_query_tiebreak: bool = False
+    # Tail-protect (recency floor) for the budget path: never V-evict the last
+    # ``ceil(query_tail_protect_frac * num_blocks)`` blocks of a request. The
+    # question sits at the prompt tail in every LongBench template, so query-
+    # agnostic V-redundancy can drop question-relevant blocks at end-of-prefill;
+    # protecting the tail grafts StreamingLLM's recency guard onto v_redundancy.
+    # None/0.0 == off (pinned v_redundancy behavior, byte-identical). Memory stays
+    # matched: the protected count is clamped so exactly enough interior blocks are
+    # still dropped to reach budget.
+    query_tail_protect_frac: float | None = None
 
     @property
     def enabled(self) -> bool:
@@ -309,6 +320,13 @@ class GeoKVConfig:
             raise ValueError(
                 "geo_kv.decode_evict_watermark must be in (0, 1) "
                 "(the low-watermark fraction of the decode capacity)"
+            )
+        if self.query_tail_protect_frac is not None and not (
+            0.0 <= self.query_tail_protect_frac < 1.0
+        ):
+            raise ValueError(
+                "geo_kv.query_tail_protect_frac must be in [0, 1) "
+                "(fraction of trailing blocks protected from V-eviction)"
             )
         if not (0.0 < self.topk_frac <= 1.0):
             raise ValueError("geo_kv.topk_frac must be in (0, 1]")
