@@ -98,7 +98,9 @@ class PrefillScorer:
                 layer_idx += 1
         self.num_layers = layer_idx
         self.sampled_layer_idxs = set(
-            resolve_indices(config.score_sampled_layers, self.num_layers)
+            resolve_indices(
+                config.score_sampled_layers, self.num_layers, strict=True
+            )
         )
 
         self.output_dir = config.output_dir or os.path.join(
@@ -191,7 +193,9 @@ class PrefillScorer:
             d = k.shape[3]
             if self._block_size is None:
                 self._block_size = block_size
-            heads = resolve_indices(cfg.score_sampled_kv_heads, num_heads)
+            heads = resolve_indices(
+                cfg.score_sampled_kv_heads, num_heads, strict=True
+            )
 
             valid = block_valid_lens(prompt_len, count, block_size, k.device)
             stats = compute_prefill_head_scores(k, valid)

@@ -31,6 +31,7 @@ all heads/layers. layer/kv_head are *scoring* dimensions only.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -38,11 +39,22 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.v1.geo_kv.config import GeoKVConfig, resolve_indices
+from vllm.v1.geo_kv.incremental_scorer import IncrementalRedundancyState
+from vllm.v1.geo_kv.layer_calibrator import LayerCalibrator
+from vllm.v1.geo_kv.scorer_profiler import ScorerProfiler
 from vllm.v1.geo_kv.scoring import (
     block_anchors,
     block_joint_redundancy,
+    block_joint_redundancy_greedy,
+    block_joint_similarity,
+    block_multi_prototype_redundancy,
+    block_prototypes,
+    block_query_attention_mass,
     block_valid_lens,
     block_value_l2,
+    positional_cosh_weights,
+    refine_with_query_relevance,
+    zscore,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -64,6 +76,8 @@ def _choose_evicted(
     k: int,
     policy: str,
     seed: int,
+    protect_mask: torch.Tensor | None = None,
+    protect_order: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Pick ``k`` blocks to evict from ``evictable_t`` under ``policy``.
 
@@ -82,6 +96,18 @@ def _choose_evicted(
         k: Number of blocks to choose (already clamped to ``0 < k <= n``).
         policy: ``"v_redundancy"``, ``"recency"``, or ``"random"``.
         seed: Seed for the ``"random"`` policy (reproducible).
+        protect_mask: optional ``(num_blocks,)`` bool of blocks to shield from
+            eviction (Phase 2 norm protection). Only the ``[lo:hi]`` slice is
+            consulted, and only for the scored ``v_redundancy`` path. Protected
+            blocks are pushed below every candidate so they are never chosen --
+            unless too few candidates remain to reach ``k``, in which case
+            protection is relaxed (see ``protect_order``) to keep the budget exact.
+        protect_order: optional ``(num_blocks,)`` float used to order relaxation
+            when the protect set leaves fewer than ``k`` candidates: protected
+            blocks are un-protected in ascending ``protect_order`` (lowest first,
+            ties by block index) until exactly ``k`` candidates are available.
+            The aggregated value-L2 norm, so the least-valuable protected blocks
+            give up protection first.
 
     Returns:
         ``(k,)`` long tensor: the chosen block indices.
@@ -90,9 +116,43 @@ def _choose_evicted(
         # Both are scored policies: highest droppability first. v_redundancy
         # scores by V-redundancy; value_l2 passes a negated value-L2 norm (so
         # lowest-norm == highest droppability), computed in _score_request_blocks.
-        local = scores.detach().to(device="cpu", dtype=torch.float32)[lo:hi]
-        order = torch.argsort(local, descending=True)
-        return evictable_t[order[:k]]
+        #
+        # Phase 1A: rank on the score's own device and move only the k chosen
+        # indices to host (the old path copied the whole score vector to CPU and
+        # fully sorted it). ``stable=True`` fixes the tie rule: equal scores keep
+        # ascending window order, so the LOWER block index is evicted first --
+        # deterministic and independent of the sort backend. For tie-free scores
+        # this selects exactly the same set as the previous unstable argsort.
+        local = scores.detach()[lo:hi].to(torch.float32)
+        if protect_mask is not None:
+            # Phase 2: shield high-value-norm blocks, but keep the budget exact by
+            # relaxing the lowest-norm protections when there are too few other
+            # candidates to reach k. Sink / anchor / tail are already outside
+            # [lo:hi], so they are never in this window and never relaxed.
+            prot = protect_mask[lo:hi].to(device=local.device, dtype=torch.bool)
+            num_prot = int(prot.sum())
+            avail = local.shape[0] - num_prot
+            if avail < k and num_prot > 0:
+                need = k - avail
+                if protect_order is not None:
+                    order_w = protect_order[lo:hi].to(
+                        device=local.device, dtype=torch.float32
+                    )
+                else:
+                    order_w = torch.zeros_like(local)
+                prot = prot.clone()
+                prot_idx = torch.nonzero(prot).flatten()
+                relax_rank = torch.argsort(
+                    order_w[prot_idx], descending=False, stable=True
+                )
+                prot[prot_idx[relax_rank[:need]]] = False
+            # Push still-protected blocks below every candidate. The relaxation
+            # above guarantees at least k finite (unprotected) scores remain.
+            local = local.masked_fill(prot, float("-inf"))
+        order = torch.argsort(local, descending=True, stable=True)
+        # ``evictable_t`` is a CPU long tensor; index it with a CPU order (the
+        # ``.cpu()`` is a no-op when the scores were already on CPU).
+        return evictable_t[order[:k].cpu()]
     if policy == "recency":
         return evictable_t[:k]  # oldest k blocks (StreamingLLM contrast)
     if policy == "random":
@@ -100,6 +160,53 @@ def _choose_evicted(
         perm = torch.randperm(evictable_t.shape[0], generator=gen)
         return evictable_t[perm[:k]]
     raise ValueError(f"unknown eviction policy: {policy!r}")
+
+
+def _value_norm_protect_mask(
+    num_blocks: int,
+    lo: int,
+    hi: int,
+    policy: str,
+    value_norm: torch.Tensor | None,
+    quantile: float | None,
+) -> torch.Tensor | None:
+    """Build the Phase-2 high-value-norm protection mask, or ``None`` if off.
+
+    Protects every evictable block whose aggregated value-L2 norm is at or above
+    the per-request ``quantile`` of the evictable window ``[lo:hi]``. Sink /
+    anchor / tail blocks sit outside that window and are handled by the caller, so
+    they are never marked here.
+
+    Args:
+        num_blocks: Current logical block count (mask length).
+        lo: Start of the evictable window (== ``warmup_pages``).
+        hi: End of the evictable window (exclusive; excludes the anchor / tail).
+        policy: Eviction policy; protection applies only to ``v_redundancy``.
+        value_norm: ``(num_blocks,)`` aggregated value-L2 norm, or ``None``.
+        quantile: Protection quantile in ``[0, 1)``, or ``None`` (off).
+
+    Returns:
+        ``(num_blocks,)`` bool mask (True == protect), or ``None`` when
+        protection is disabled or inapplicable.
+    """
+    if (
+        quantile is None
+        or value_norm is None
+        or policy != "v_redundancy"
+        or hi - lo <= 0
+    ):
+        return None
+    win = value_norm[lo:hi].to(dtype=torch.float32)
+    if win.numel() == 0:
+        return None
+    # ``quantile`` interpolates linearly, so q == 0 -> min (protect all, then the
+    # budget relaxation peels the lowest-norm blocks back to exactly k -> behaves
+    # like a value-L2 cut); q near 1 -> only the top-norm blocks are protected
+    # (near-pure V-redundancy).
+    thr = torch.quantile(win, float(quantile))
+    mask = torch.zeros(num_blocks, dtype=torch.bool)
+    mask[lo:hi] = (win >= thr).to(device="cpu")
+    return mask
 
 
 def select_evicted_blocks(
@@ -157,6 +264,8 @@ def select_evicted_to_budget(
     policy: str = "v_redundancy",
     seed: int = 0,
     tail_protect_frac: float | None = None,
+    value_norm: torch.Tensor | None = None,
+    value_norm_protect_quantile: float | None = None,
 ) -> torch.Tensor:
     """Evict interior blocks down to a per-request budget under ``policy``.
 
@@ -185,6 +294,16 @@ def select_evicted_to_budget(
             lives). Clamped so enough interior blocks remain to still reach
             ``budget`` -- memory stays matched. None/0.0 restores the pinned
             v_redundancy window (no tail guard beyond the single anchor).
+        value_norm: optional ``(num_blocks,)`` aggregated value-L2 norm per block,
+            required when ``value_norm_protect_quantile`` is set. Used both to
+            build the protection threshold and to order relaxation.
+        value_norm_protect_quantile: Phase 2 norm-constrained redundancy. When set
+            (and ``value_norm`` given), protect blocks whose value-L2 norm is at or
+            above this per-request quantile so V-eviction chooses among the
+            remaining lower-norm blocks. Budget stays exact: if too few candidates
+            remain, the lowest-norm protections are relaxed until ``k`` are
+            available. Applies only to the scored ``v_redundancy`` path; sink /
+            anchor / tail protection always take priority. None == off.
 
     Returns:
         ``(num_blocks,)`` bool tensor; True = evict (hide from attention).
@@ -212,9 +331,83 @@ def select_evicted_to_budget(
     k = min(k, n)
     if k <= 0:
         return evict
+    protect_mask = _value_norm_protect_mask(
+        num_blocks, lo, hi, policy, value_norm, value_norm_protect_quantile
+    )
     evictable_t = torch.tensor(evictable, dtype=torch.long)
-    chosen = _choose_evicted(evictable_t, scores, lo, hi, k, policy, seed)
+    chosen = _choose_evicted(
+        evictable_t,
+        scores,
+        lo,
+        hi,
+        k,
+        policy,
+        seed,
+        protect_mask=protect_mask,
+        protect_order=value_norm if protect_mask is not None else None,
+    )
     evict[chosen] = True
+    return evict
+
+
+def select_evicted_by_coverage(
+    similarity: torch.Tensor,
+    num_blocks: int,
+    budget: int,
+    warmup_pages: int,
+    tail_protect_frac: float | None = None,
+    importance: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Construct a global kept set by greedy facility-location coverage.
+
+    Maximizes ``sum_b importance[b] * max_{s in kept} similarity[b, s]`` at the
+    actual keep budget. Sink, final anchor, and configured tail blocks seed the
+    kept set before additions. Selection happens once on the similarity matrix
+    aggregated across layers, unlike the older greedy mode's independent
+    per-layer ordinal peels.
+    """
+    evict = torch.zeros(num_blocks, dtype=torch.bool)
+    if num_blocks <= budget:
+        return evict
+    if similarity.shape != (num_blocks, num_blocks):
+        raise ValueError("coverage similarity must be square and match num_blocks")
+    lo = max(int(warmup_pages), 0)
+    hi = num_blocks - 1
+    k = min(num_blocks - budget, max(hi - lo, 0))
+    if k <= 0:
+        return evict
+    if tail_protect_frac:
+        tail = math.ceil(tail_protect_frac * num_blocks)
+        tail = max(0, min(tail, (hi - lo) - k))
+        hi -= tail
+    keep_target = num_blocks - k
+    protected = np.zeros(num_blocks, dtype=np.bool_)
+    protected[:lo] = True
+    protected[hi:] = True
+    kept = protected.copy()
+
+    sim = similarity.detach().to(device="cpu", dtype=torch.float32).numpy()
+    if importance is None:
+        weight = np.ones(num_blocks, dtype=np.float32)
+    else:
+        if importance.shape != (num_blocks,):
+            raise ValueError("coverage importance must match num_blocks")
+        weight = importance.detach().to(device="cpu", dtype=torch.float32).numpy()
+        if np.any(weight < 0):
+            raise ValueError("coverage importance must be non-negative")
+
+    protected_idx = np.flatnonzero(protected)
+    # The final anchor is always protected, so this is non-empty for B >= 2.
+    coverage = sim[:, protected_idx].max(axis=1)
+    while int(kept.sum()) < keep_target:
+        gain = (np.maximum(sim - coverage[:, None], 0.0) * weight[:, None]).sum(
+            axis=0
+        )
+        gain[kept] = -np.inf
+        chosen = int(np.argmax(gain))  # first index gives deterministic tie-break
+        kept[chosen] = True
+        coverage = np.maximum(coverage, sim[:, chosen])
+    evict.copy_(torch.from_numpy(~kept))
     return evict
 
 
@@ -315,6 +508,7 @@ class EvictionPolicy:
         block_size: int,
         device: torch.device,
         num_evicted_tokens_np: Any = None,
+        query_capturer: Any = None,
     ) -> None:
         self.config = config
         self.kv = kv_caches_by_layer
@@ -325,6 +519,7 @@ class EvictionPolicy:
         # runner's RequestState). Decode scoring subtracts this to recover the
         # storage length from the uncompacted seq_len. None => never compacted.
         self.num_evicted_tokens_np = num_evicted_tokens_np
+        self.query_capturer = query_capturer
 
         # Ordered attention-layer metadata: (layer_idx, layer_name, group_id).
         # Built identically to PrefillScorer so the sampled-layer band lines up.
@@ -339,8 +534,37 @@ class EvictionPolicy:
                 layer_idx += 1
         self.num_layers = layer_idx
         self.sampled_layer_idxs = set(
-            resolve_indices(config.score_sampled_layers, self.num_layers)
+            resolve_indices(
+                config.score_sampled_layers, self.num_layers, strict=True
+            )
         )
+        # Opt-in scorer profiler (plan Phase 1B). A no-op unless enable_tracing is
+        # set; when off it adds no timing and no device synchronization.
+        self.profiler = ScorerProfiler(
+            enabled=bool(config.enable_tracing),
+            device=device,
+            log_path=config.log_path,
+        )
+        # Opt-in layer-subset calibrator (plan Phase 1C). Only meaningful while
+        # scoring all layers (there must be all rows to sub-select from); a no-op
+        # otherwise. Requires enable_tracing so it never runs on serving paths.
+        self.layer_calibrator = LayerCalibrator(
+            enabled=bool(
+                config.calibrate_layer_subsets
+                and config.enable_tracing
+                and config.score_sampled_layers == "all"
+            ),
+            num_layers=self.num_layers,
+            log_path=config.log_path,
+        )
+        # Per-fire scratch for the calibrator (set by scoring, read by the
+        # selection site). Only populated when the calibrator is enabled.
+        self._cal_stacked: torch.Tensor | None = None
+        self._cal_vnorm_stacked: torch.Tensor | None = None
+        self._cal_row_layer_idxs: list[int] = []
+        # Per-fire global similarity matrix for the corrected facility-location
+        # selector. Populated only by redundancy_mode="coverage".
+        self._coverage_similarity: torch.Tensor | None = None
         self._num_requests_evicted = 0
         # Decode-time eviction counters/throttle (mask-only).
         self._decode_step = 0
@@ -352,11 +576,20 @@ class EvictionPolicy:
         max_num_reqs = int(self.evicted_store.shape[0])
         self._decode_cap_np = np.zeros(max_num_reqs, dtype=np.int32)
         self._decode_low_np = np.zeros(max_num_reqs, dtype=np.int32)
+        # Phase 6: lazy, bounded metadata for requests that have actually fired
+        # the scorer.  State tensors are pooled-anchor/similarity copies and do
+        # not alias paged KV.  A generation advances only at an authoritative
+        # lifecycle boundary (compaction landing or request-slot reset).
+        self._incremental_states: dict[
+            int, dict[int, IncrementalRedundancyState]
+        ] = {}
+        self._incremental_pending_masks: dict[int, torch.Tensor] = {}
+        self._incremental_generation_np = np.zeros(max_num_reqs, dtype=np.int64)
         logger.info(
             "[geo_kv] EvictionPolicy ready: %d attn layers, band=%s, "
             "policy=%s, rate=%s, agg=%s, warmup_pages=%s, capacity=%s, "
             "watermark=%s, prefill_frac=%s, decode_frac=%s, "
-            "physical_reclaim=%s",
+            "decode_blocks_per_step=%s, physical_reclaim=%s",
             self.num_layers,
             config.score_sampled_layers,
             config.eviction_policy,
@@ -367,6 +600,7 @@ class EvictionPolicy:
             config.decode_evict_watermark,
             config.prefill_evict_frac,
             config.decode_evict_frac,
+            config.decode_evict_blocks_per_step,
             config.physical_reclaim,
         )
 
@@ -382,6 +616,42 @@ class EvictionPolicy:
         """
         self._decode_cap_np[req_index] = 0
         self._decode_low_np[req_index] = 0
+        self._incremental_generation_np[req_index] += 1
+        self._incremental_states.pop(req_index, None)
+        self._incremental_pending_masks.pop(req_index, None)
+
+    def _stage_incremental_eviction(
+        self, req_index: int, eviction_mask: torch.Tensor
+    ) -> None:
+        """Remember the old-row mask until its physical compaction lands."""
+        if not self.config.incremental_decode_scoring:
+            return
+        self._incremental_pending_masks[req_index] = (
+            eviction_mask.detach().to(device="cpu", dtype=torch.bool).clone()
+        )
+
+    def on_compaction_applied(self, req_index: int, survivor_count: int) -> None:
+        """Acknowledge the runner's authoritative physical row replacement.
+
+        Cached state is pruned only here, after the scheduler snapshot passed the
+        runner's row-length assertion.  Missing/mismatched pending state is
+        invalidated conservatively; it is never guessed from reusable physical
+        block ids.
+        """
+        if not self.config.incremental_decode_scoring:
+            return
+        generation = int(self._incremental_generation_np[req_index]) + 1
+        self._incremental_generation_np[req_index] = generation
+        pending = self._incremental_pending_masks.pop(req_index, None)
+        states = self._incremental_states.get(req_index)
+        if pending is None or not states:
+            self._incremental_states.pop(req_index, None)
+            return
+        for state in states.values():
+            state.retain(pending, generation)
+            if state.num_blocks != survivor_count:
+                self._incremental_states.pop(req_index, None)
+                return
 
     # -- per-step entry point ----------------------------------------------
     def on_step(
@@ -439,6 +709,9 @@ class EvictionPolicy:
     ) -> torch.Tensor | None:
         """Score a request's blocks by V-redundancy across the sampled layers.
 
+        Thin wrapper over :meth:`_score_request_blocks_with_vnorm` that returns
+        only the droppability scores (the value-norm is discarded).
+
         Args:
             req_index: Persistent request-state index.
             valid_len: Sequence length used to compute per-block valid token
@@ -449,32 +722,416 @@ class EvictionPolicy:
             ``(count,)`` aggregated droppability scores, or ``None`` when the
             request holds fewer than two blocks (nothing to evict).
         """
+        scores, _ = self._score_request_blocks_with_vnorm(
+            req_index, valid_len, block_tables
+        )
+        return scores
+
+    def _score_request_blocks_with_vnorm(
+        self, req_index: int, valid_len: int, block_tables: Any
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Score a request's blocks and, when needed, its per-block value norm.
+
+        Args:
+            req_index: Persistent request-state index.
+            valid_len: Sequence length used to compute per-block valid token
+                counts (prompt length at admission; storage length at decode).
+            block_tables: The runner's block tables.
+
+        Returns:
+            ``(scores, value_norm)``. ``scores`` is the ``(count,)`` aggregated
+            droppability, or ``None`` when the request holds fewer than two
+            blocks. ``value_norm`` is the matching ``(count,)`` aggregated
+            positive value-L2 norm (higher == more valuable), populated only when
+            the blend or the Phase-2 norm-protection quantile is active; ``None``
+            otherwise.
+        """
         cfg = self.config
+        self._coverage_similarity = None
         value_l2 = cfg.eviction_policy == "value_l2"
+        greedy = (not value_l2) and cfg.redundancy_mode == "greedy"
+        coverage_mode = (not value_l2) and cfg.redundancy_mode == "coverage"
+        blend_beta = None if value_l2 else cfg.value_blend_beta
+        # Phase 2 norm protection also needs the per-block value-L2 norm; compute
+        # it whenever either consumer is active (both only apply to v_redundancy).
+        want_vnorm = (not value_l2) and (
+            bool(blend_beta) or cfg.value_norm_protect_quantile is not None
+        )
+        want_query = (not value_l2) and cfg.query_relevance_enabled
+        warmup = int(cfg.warmup_pages or 0)
         per_layer: list[torch.Tensor] = []
+        per_layer_vnorm: list[torch.Tensor] = []  # populated when want_vnorm
+        per_layer_query: list[torch.Tensor] = []  # populated when available
+        per_layer_similarity: list[torch.Tensor] = []
+        query_window_len: int | None = None
+        scored_layer_idxs: list[int] = []  # global layer idx per per_layer row
+        prof = self.profiler
+        num_scored_layers = 0
+        block_count = 0
+        incremental = cfg.incremental_decode_scoring
+        generation = int(self._incremental_generation_np[req_index])
         for layer_idx, layer_name, group_id in self.layers:
             if layer_idx not in self.sampled_layer_idxs:
                 continue
             c = int(block_tables.num_blocks.np[group_id, req_index])
             if c < 2:
                 continue
-            block_ids = (
-                block_tables.block_tables[group_id].gpu[req_index, :c].to(torch.long)
+            valid_lens_cpu = tuple(
+                max(0, min(self.block_size, valid_len - i * self.block_size))
+                for i in range(c)
             )
-            v = self.kv[layer_name][block_ids, 1]  # (c, block_size, H, D)
-            valid = block_valid_lens(valid_len, c, v.shape[1], v.device)
+            incremental_state: IncrementalRedundancyState | None = None
+            changed_positions: list[int] | None = None
+            changed_positions_tensor: torch.Tensor | None = None
+            if incremental:
+                request_states = self._incremental_states.setdefault(req_index, {})
+                incremental_state = request_states.setdefault(
+                    layer_idx, IncrementalRedundancyState.empty(generation)
+                )
+                changed_positions = incremental_state.changed_positions(
+                    valid_lens_cpu, generation
+                )
+                changed_positions_tensor = torch.tensor(
+                    changed_positions, dtype=torch.long, device=self.device
+                )
+            with prof.section("gather"):
+                if incremental_state is not None:
+                    assert changed_positions is not None
+                    assert changed_positions_tensor is not None
+                    changed_block_ids = (
+                        block_tables.block_tables[group_id]
+                        .gpu[req_index, :c]
+                        .index_select(0, changed_positions_tensor)
+                        .to(torch.long)
+                    )
+                    v = self.kv[layer_name][changed_block_ids, 1]
+                    block_ids = None
+                else:
+                    block_ids = (
+                        block_tables.block_tables[group_id]
+                        .gpu[req_index, :c]
+                        .to(torch.long)
+                    )
+                    v = self.kv[layer_name][
+                        block_ids, 1
+                    ]  # (c, block_size, H, D)
+                queries = (
+                    self.query_capturer.get(req_index, layer_idx)
+                    if want_query and self.query_capturer is not None
+                    else None
+                )
+                k = (
+                    self.kv[layer_name][block_ids, 0]
+                    if queries is not None and block_ids is not None
+                    else None
+                )
+            num_scored_layers += 1
+            block_count = c
+            scored_layer_idxs.append(layer_idx)
+            valid = block_valid_lens(valid_len, c, self.block_size, self.device)
             if value_l2:
                 # Paged-Eviction baseline: drop lowest value-L2-norm blocks.
                 # Negate so higher == more droppable, matching the scored-policy
                 # convention consumed by argsort(descending) in _choose_evicted.
-                per_layer.append(-block_value_l2(v, valid))
-            else:
-                per_layer.append(block_joint_redundancy(block_anchors(v, valid)))
+                with prof.section("anchor_norm"):
+                    per_layer.append(
+                        -block_value_l2(v, valid, cfg.value_l2_block_reduction)
+                    )
+                continue
+            with prof.section("anchor_norm"):
+                if cfg.block_prototype_mode == "mean":
+                    if incremental_state is not None:
+                        assert changed_positions is not None
+                        assert changed_positions_tensor is not None
+                        if changed_positions:
+                            anchors = block_anchors(
+                                v, valid.index_select(0, changed_positions_tensor)
+                            )
+                        else:
+                            anchors = torch.empty(
+                                (
+                                    0,
+                                    *incremental_state.normalized_anchors.shape[1:],
+                                ),
+                                dtype=torch.float32,
+                                device=self.device,
+                            )
+                    else:
+                        anchors = block_anchors(v, valid)
+                    prototypes = prototype_valid = None
+                else:
+                    prototypes, prototype_valid = block_prototypes(
+                        v, valid, cfg.block_prototype_mode
+                    )
+                    anchors = None
+                if want_vnorm:
+                    per_layer_vnorm.append(block_value_l2(v, valid))
+            if queries is not None:
+                assert k is not None
+                query_window_len = int(queries.shape[0])
+                with prof.section("query_attention"):
+                    per_layer_query.append(
+                        block_query_attention_mass(
+                            queries,
+                            k,
+                            valid,
+                            self.query_capturer.scale(layer_idx),
+                        )
+                    )
+            with prof.section("similarity"):
+                if coverage_mode:
+                    assert anchors is not None
+                    similarity = block_joint_similarity(anchors)
+                    per_layer_similarity.append(similarity)
+                    diagonal = torch.eye(c, dtype=torch.bool, device=v.device)
+                    per_layer.append(
+                        similarity.masked_fill(diagonal, float("-inf"))
+                        .max(dim=1)
+                        .values
+                    )
+                elif greedy:
+                    assert anchors is not None
+                    # Keep sink + anchor in the comparison set (a block that
+                    # duplicates them is genuinely redundant) but never peel them.
+                    protect = torch.zeros(c, dtype=torch.bool, device=v.device)
+                    if warmup > 0:
+                        protect[: min(warmup, c)] = True
+                    protect[c - 1] = True  # decode anchor
+                    per_layer.append(
+                        block_joint_redundancy_greedy(anchors, protect=protect)
+                    )
+                else:
+                    if anchors is not None:
+                        if incremental_state is not None:
+                            assert changed_positions is not None
+                            per_layer.append(
+                                incremental_state.update(
+                                    valid_lens_cpu,
+                                    generation,
+                                    changed_positions,
+                                    anchors,
+                                    changed_positions_tensor,
+                                )
+                            )
+                            prof.record_incremental_update(
+                                total_blocks=c,
+                                recomputed_blocks=len(changed_positions),
+                            )
+                        else:
+                            per_layer.append(block_joint_redundancy(anchors))
+                    else:
+                        assert prototypes is not None
+                        assert prototype_valid is not None
+                        per_layer.append(
+                            block_multi_prototype_redundancy(
+                                prototypes, prototype_valid
+                            )
+                        )
         if not per_layer:
-            return None
-        stacked = torch.stack(per_layer, dim=0)  # (num_sampled, count)
-        return aggregate_layer_scores(
-            stacked, cfg.block_score_aggregation, cfg.topk_frac
+            return None, None
+        with prof.section("aggregate"):
+            stacked = torch.stack(per_layer, dim=0)  # (num_sampled, count)
+            scores = aggregate_layer_scores(
+                stacked, cfg.block_score_aggregation, cfg.topk_frac
+            )
+            # Aggregate the positive value-L2 norm on the same footing as the
+            # scores (same layer aggregation / topk_frac), for the blend and/or
+            # Phase-2 norm protection. Higher == more valuable.
+            vnorm: torch.Tensor | None = None
+            if want_vnorm and per_layer_vnorm:
+                vnorm = aggregate_layer_scores(
+                    torch.stack(per_layer_vnorm, dim=0),
+                    cfg.block_score_aggregation,
+                    cfg.topk_frac,
+                )
+            query_relevance: torch.Tensor | None = None
+            if per_layer_query:
+                query_relevance = torch.stack(per_layer_query, dim=0).mean(dim=0)
+            if per_layer_similarity:
+                self._coverage_similarity = aggregate_layer_scores(
+                    torch.stack(per_layer_similarity, dim=0),
+                    cfg.block_score_aggregation,
+                    cfg.topk_frac,
+                )
+        prof.record_fire(block_count, num_scored_layers)
+        if query_window_len is not None:
+            prof.record_query_window(query_window_len)
+        # Stash the raw per-layer stacks for the Phase-1C calibrator (all-layer
+        # only). Kept as detached references so the calibrator can re-aggregate
+        # arbitrary subsets against the reference selection computed downstream.
+        if self.layer_calibrator.enabled:
+            self._cal_stacked = stacked
+            self._cal_vnorm_stacked = (
+                torch.stack(per_layer_vnorm, dim=0) if per_layer_vnorm else None
+            )
+            self._cal_row_layer_idxs = list(scored_layer_idxs)
+        scores = self._finalize_scores(
+            scores, vnorm, value_l2, query_relevance=query_relevance
+        )
+        return scores, vnorm
+
+    def _finalize_scores(
+        self,
+        scores: torch.Tensor,
+        vnorm: torch.Tensor | None,
+        value_l2: bool,
+        query_relevance: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Apply the value-norm blend and positional-cosh re-weight to scores.
+
+        Shared by the main scoring path and the Phase-1C calibrator so a layer
+        subset's aggregated scores go through exactly the same post-aggregation
+        pipeline as the all-layer reference before selection.
+
+        Args:
+            scores: ``(count,)`` aggregated redundancy droppability.
+            vnorm: ``(count,)`` aggregated value-L2 norm, or ``None``.
+            value_l2: Whether the active policy is the value_l2 baseline (which
+                skips both re-weights and keeps its raw negated norm).
+
+        Returns:
+            ``(count,)`` finalized droppability scores.
+        """
+        cfg = self.config
+        blend_beta = None if value_l2 else cfg.value_blend_beta
+        # Value-norm blend: combine the redundancy droppability with the
+        # (negated) value-L2 signal on a common per-request z-scored footing so
+        # ``value_blend_beta`` is scale-free. A high-value-norm block becomes
+        # less droppable. The two signals win on disjoint task types (redundancy
+        # on span-finding QA, value-L2 on distributed-information summarization),
+        # so the blend aims to capture both. Inert when beta is None/0.
+        if blend_beta and vnorm is not None:
+            scores = zscore(scores) - float(blend_beta) * zscore(vnorm)
+        if not value_l2:
+            scores = refine_with_query_relevance(
+                scores,
+                query_relevance,
+                cfg.query_alignment_weight,
+                cfg.enable_query_tiebreak,
+            )
+        # Positional cosh (sech-bump) re-weight: pull v_redundancy eviction
+        # toward the middle and away from the ends. Only for the scored thesis
+        # signal (value_l2 keeps its raw negated norm); inert when alpha is
+        # None/0. Droppability can be negative (cosine), so shift to >= 0 before
+        # multiplying by the positive weight -- otherwise the weight would flip
+        # the ranking on negative scores. The shift is a monotone per-request
+        # affine, so ordering is unchanged when the weights are uniform.
+        alpha = cfg.positional_cosh_alpha
+        if not value_l2 and alpha and scores.shape[0] >= 2:
+            w = positional_cosh_weights(
+                scores.shape[0], float(alpha), scores.device, scores.dtype
+            )
+            shifted = scores - scores.min()
+            scores = shifted * w
+        return scores
+
+    def _calibrate_layers(
+        self,
+        reference_mask: torch.Tensor,
+        select_fn: Callable[[torch.Tensor, torch.Tensor | None], torch.Tensor],
+    ) -> None:
+        """Score fixed layer subsets and record their agreement with the fire.
+
+        Uses the stacks stashed by :meth:`_score_request_blocks_with_vnorm` on
+        this fire to re-aggregate + finalize each candidate subset, applies the
+        caller's own selector, then feeds the resulting mask to the calibrator so
+        it can accumulate selected-block agreement (Jaccard) vs the all-layer
+        ``reference_mask``. Only invoked when the calibrator is enabled.
+
+        Passing the selector as a closure keeps this path selector-agnostic: the
+        legacy rate path, the capacity-band path, and the frac path each supply
+        the same budget selector they used for the reference, so a subset mask is
+        always compared against a like-for-like reference.
+
+        Args:
+            reference_mask: The ``(count,)`` all-layer eviction mask.
+            select_fn: Maps ``(finalized_scores, vnorm)`` to a ``(count,)`` bool
+                eviction mask using the caller's selection policy/budget.
+        """
+        cfg = self.config
+        stacked = self._cal_stacked
+        vnorm_stacked = self._cal_vnorm_stacked
+        if stacked is None:
+            return
+        value_l2 = cfg.eviction_policy == "value_l2"
+
+        def aggregate_and_select(rows: list[int]) -> torch.Tensor:
+            idx = torch.tensor(rows, dtype=torch.long, device=stacked.device)
+            scores = aggregate_layer_scores(
+                stacked[idx], cfg.block_score_aggregation, cfg.topk_frac
+            )
+            vnorm = None
+            if vnorm_stacked is not None:
+                vnorm = aggregate_layer_scores(
+                    vnorm_stacked[idx], cfg.block_score_aggregation, cfg.topk_frac
+                )
+            scores = self._finalize_scores(scores, vnorm, value_l2)
+            return select_fn(scores, vnorm)
+
+        self.layer_calibrator.observe(
+            self._cal_row_layer_idxs, reference_mask, aggregate_and_select
+        )
+
+    def _select_budget_mask(
+        self,
+        scores: torch.Tensor,
+        count: int,
+        budget: int,
+        value_norm: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Dispatch a budget cut to pairwise ranking or global coverage."""
+        cfg = self.config
+        if cfg.redundancy_mode == "coverage":
+            similarity = self._coverage_similarity
+            if similarity is None:
+                raise RuntimeError("coverage selection missing aggregated similarity")
+            return select_evicted_by_coverage(
+                similarity,
+                count,
+                budget,
+                int(cfg.warmup_pages or 0),
+                cfg.query_tail_protect_frac,
+            )
+        return select_evicted_to_budget(
+            scores,
+            count,
+            budget,
+            int(cfg.warmup_pages or 0),
+            cfg.eviction_policy,
+            cfg.eviction_seed,
+            cfg.query_tail_protect_frac,
+            value_norm=value_norm,
+            value_norm_protect_quantile=cfg.value_norm_protect_quantile,
+        )
+
+    def _select_rate_mask(
+        self,
+        scores: torch.Tensor,
+        count: int,
+        rate: float,
+    ) -> torch.Tensor:
+        """Dispatch the legacy matched-rate cut, preserving its exact count."""
+        cfg = self.config
+        if cfg.redundancy_mode == "coverage":
+            lo = max(int(cfg.warmup_pages or 0), 0)
+            evictable = max(count - 1 - lo, 0)
+            num_evict = min(int(round(rate * evictable)), evictable)
+            similarity = self._coverage_similarity
+            if similarity is None:
+                raise RuntimeError("coverage selection missing aggregated similarity")
+            return select_evicted_by_coverage(
+                similarity,
+                count,
+                count - num_evict,
+                lo,
+            )
+        return select_evicted_blocks(
+            scores,
+            count,
+            rate,
+            cfg.eviction_policy,
+            int(cfg.warmup_pages or 0),
+            cfg.eviction_seed,
         )
 
     def _evict_request(
@@ -509,28 +1166,35 @@ class EvictionPolicy:
             keep = max(1, math.ceil(cfg.prefill_evict_frac * count))
             if keep >= count:
                 return []
-            scores = self._score_request_blocks(req_index, prompt_len, block_tables)
+            scores, vnorm = self._score_request_blocks_with_vnorm(
+                req_index, prompt_len, block_tables
+            )
             if scores is None:
                 return []
-            mask = select_evicted_to_budget(
-                scores,
-                count,
-                keep,
-                int(cfg.warmup_pages or 0),
-                cfg.eviction_policy,
-                cfg.eviction_seed,
-                cfg.query_tail_protect_frac,
-            )
-            self.evicted_store[req_index, : scores.shape[0]].copy_(
-                mask.to(self.evicted_store.device)
-            )
+
+            def _select_to_budget(
+                s: torch.Tensor, vn: torch.Tensor | None
+            ) -> torch.Tensor:
+                return self._select_budget_mask(s, count, keep, vn)
+
+            with self.profiler.section("selection"):
+                mask = _select_to_budget(scores, vnorm)
+            if self.layer_calibrator.enabled:
+                self._calibrate_layers(mask, _select_to_budget)
+            with self.profiler.section("transfer"):
+                self.evicted_store[req_index, : scores.shape[0]].copy_(
+                    mask.to(self.evicted_store.device)
+                )
             if not cfg.physical_reclaim:
                 return []
+            self._stage_incremental_eviction(req_index, mask)
             return torch.nonzero(mask).flatten().tolist()
 
         # Legacy coupled paths (rate / decode_evict_budget). Both share the same
         # end-of-prefill scoring over the full prompt.
-        scores = self._score_request_blocks(req_index, prompt_len, block_tables)
+        scores, vnorm = self._score_request_blocks_with_vnorm(
+            req_index, prompt_len, block_tables
+        )
         if scores is None:
             return []
         count = int(scores.shape[0])
@@ -544,27 +1208,22 @@ class EvictionPolicy:
             capacity, low = capacity_band(cfg)
             if count < capacity:
                 return []
-            mask = select_evicted_to_budget(
-                scores,
-                count,
-                low,
-                int(cfg.warmup_pages or 0),
-                cfg.eviction_policy,
-                cfg.eviction_seed,
-                cfg.query_tail_protect_frac,
-            )
+
+            def _select(s: torch.Tensor, vn: torch.Tensor | None) -> torch.Tensor:
+                return self._select_budget_mask(s, count, low, vn)
         else:
-            mask = select_evicted_blocks(
-                scores,
-                count,
-                cfg.eviction_rate or 0.0,
-                cfg.eviction_policy,
-                int(cfg.warmup_pages or 0),
-                cfg.eviction_seed,
-            )
+
+            def _select(s: torch.Tensor, vn: torch.Tensor | None) -> torch.Tensor:
+                return self._select_rate_mask(s, count, cfg.eviction_rate or 0.0)
+
+        with self.profiler.section("selection"):
+            mask = _select(scores, vnorm)
+        if self.layer_calibrator.enabled:
+            self._calibrate_layers(mask, _select)
         self.evicted_store[req_index, :count].copy_(mask.to(self.evicted_store.device))
         if not cfg.physical_reclaim:
             return []
+        self._stage_incremental_eviction(req_index, mask)
         # The store row was all-False before this write, so every True here is
         # newly evicted. These are logical block indices the scheduler will
         # physically free
@@ -572,7 +1231,10 @@ class EvictionPolicy:
 
     # -- decode-time eviction (capacity band, physical reclaim) ------------
     def on_decode_step(
-        self, input_batch: InputBatch, block_tables: Any
+        self,
+        input_batch: InputBatch,
+        block_tables: Any,
+        cache_free_fraction: float | None = None,
     ) -> dict[str, list[int]]:
         """Enforce the per-request capacity band during decode.
 
@@ -584,21 +1246,42 @@ class EvictionPolicy:
         to compact and free; the mask hides them for the one-step latency window
         until the compaction lands. A no-op unless ``decode_evict_budget`` is set.
 
+        Args:
+            input_batch: The current decode batch.
+            block_tables: The model runner's block tables.
+            cache_free_fraction: Global KV-pool free fraction for this step
+                (scheduler-side signal). Only consulted when
+                ``decode_evict_pressure_watermark`` is set, to gate the drip on
+                cache pressure. ``None`` is treated as "pool full" (fire), so a
+                caller that omits it keeps the unconditional drip behavior.
+
         Returns:
             Mapping ``{req_id: freed_logical_block_indices}`` for requests
             evicted this step (physical reclaim only; empty under mask-only).
         """
         cfg = self.config
-        # Decoupled frac path takes precedence; else the coupled budget path.
+        # Three decode paths, mutually exclusive (enforced in config.validate):
+        # fixed-rate drip > per-request frac band > coupled global budget band.
+        drip = cfg.decode_evict_blocks_per_step
         frac_decode = cfg.decode_evict_frac is not None
-        if not frac_decode and cfg.decode_evict_budget is None:
+        if drip is None and not frac_decode and cfg.decode_evict_budget is None:
             return {}
+        # Pressure gate (drip only): fire only once the global pool is >= watermark
+        # full. Validation guarantees the watermark coexists only with the drip, so
+        # this never affects the frac / budget paths. A missing signal -> full ->
+        # fire (preserves unconditional behavior for callers that omit it).
+        if cfg.decode_evict_pressure_watermark is not None:
+            free = cache_free_fraction if cache_free_fraction is not None else 0.0
+            if (1.0 - free) < cfg.decode_evict_pressure_watermark:
+                return {}
         self._decode_step += 1
         if self._decode_step % max(int(cfg.decode_evict_interval), 1) != 0:
             return {}
-        # Global band for the legacy budget path; per-request bands (resolved at
-        # admission) for the frac path.
-        cap_g, low_g = (0, 0) if frac_decode else capacity_band(cfg)
+        # Global band for the legacy budget path only; the drip and frac paths do
+        # not use it (capacity_band asserts decode_evict_budget is not None).
+        cap_g, low_g = (
+            capacity_band(cfg) if (drip is None and not frac_decode) else (0, 0)
+        )
         freed: dict[str, list[int]] = {}
         for i in range(input_batch.num_reqs):
             if bool(input_batch.is_prefilling_np[i]):
@@ -606,21 +1289,27 @@ class EvictionPolicy:
             if input_batch.req_ids[i].startswith(_SYNTHETIC_REQ_PREFIXES):
                 continue
             req_index = int(input_batch.idx_mapping_np[i])
-            if frac_decode:
-                capacity = int(self._decode_cap_np[req_index])
-                low = int(self._decode_low_np[req_index])
-                if capacity < 2:
-                    continue  # decode eviction not armed for this request
-            else:
-                capacity, low = cap_g, low_g
             # Current total sequence length after this step's tokens (RoPE /
             # uncompacted positions); storage length subtracts evicted tokens.
             seq_len = int(input_batch.num_computed_tokens_np[i]) + int(
                 input_batch.num_scheduled_tokens[i]
             )
-            evicted = self._evict_decode_request(
-                req_index, seq_len, block_tables, capacity, low
-            )
+            if drip is not None:
+                # Drip reads no per-request band; it targets N below live count.
+                evicted = self._evict_decode_request(
+                    req_index, seq_len, block_tables, 0, 0, blocks_per_step=drip
+                )
+            else:
+                if frac_decode:
+                    capacity = int(self._decode_cap_np[req_index])
+                    low = int(self._decode_low_np[req_index])
+                    if capacity < 2:
+                        continue  # decode eviction not armed for this request
+                else:
+                    capacity, low = cap_g, low_g
+                evicted = self._evict_decode_request(
+                    req_index, seq_len, block_tables, capacity, low
+                )
             if evicted:
                 freed[input_batch.req_ids[i]] = evicted
         return freed
@@ -632,8 +1321,20 @@ class EvictionPolicy:
         block_tables: Any,
         capacity: int,
         low: int,
+        blocks_per_step: int | None = None,
     ) -> list[int]:
-        """Evict one decoding request down to the low watermark at capacity.
+        """Evict one decoding request during decode.
+
+        Two triggers share this body (only the trigger + target budget differ;
+        scoring, the physical/mask-only branches, and the in-flight guard are
+        identical):
+
+        - Watermark band (``blocks_per_step is None``): fire only once the request
+          has regrown to ``capacity`` C, then evict down to the low watermark
+          ``low``. This is the hysteresis band.
+        - Fixed-rate drip (``blocks_per_step=N``): no capacity gate — evict exactly
+          N interior blocks whenever any remain (target budget ``count - N``),
+          draining monotonically toward the floor (sink + anchor + tail).
 
         Mirrors :meth:`_evict_request`'s scoring but on the *storage* basis: the
         block table row is already compacted, so validity uses the storage length
@@ -646,8 +1347,8 @@ class EvictionPolicy:
         still in flight — the block table has not yet been repacked. Firing then
         would score a stale row and hand the scheduler indices into a list it has
         already compacted, corrupting it. So skip until the compaction lands (the
-        model runner zeroes the row on apply). Growth back to ``C`` after that is
-        what re-arms the trigger — this is the hysteresis band.
+        model runner zeroes the row on apply). For the drip this guard is what
+        halves the effective cadence to ~N blocks per 2 steps.
 
         Returns:
             Logical (storage) block indices to physically free, or ``[]`` when
@@ -657,37 +1358,42 @@ class EvictionPolicy:
         physical = cfg.physical_reclaim
         if physical and bool(self.evicted_store[req_index].any()):
             return []  # compaction in flight; wait for the row to clear
-        # Hysteresis: fire only once the request has regrown to capacity C.
-        # Read the block count cheaply first to skip scoring when under C.
+        # Read the block count cheaply first to decide whether to score at all.
         count = self._prompt_block_count(req_index, block_tables)
-        if count < capacity or count < 2:
-            return []
+        warmup = int(cfg.warmup_pages or 0)
+        if blocks_per_step is not None:
+            # Drip: no capacity gate; target N below current. Skip scoring once
+            # only sink + anchor remain (select would evict nothing anyway).
+            if count <= warmup + 1 or count < 2:
+                return []
+            budget = max(count - int(blocks_per_step), 0)
+        else:
+            # Hysteresis: fire only once the request has regrown to capacity C.
+            if count < capacity or count < 2:
+                return []
+            budget = low
         num_evicted = 0
         if self.num_evicted_tokens_np is not None:
             num_evicted = int(self.num_evicted_tokens_np[req_index])
         storage_len = seq_len - num_evicted
-        scores = self._score_request_blocks(req_index, storage_len, block_tables)
+        scores, vnorm = self._score_request_blocks_with_vnorm(
+            req_index, storage_len, block_tables
+        )
         if scores is None:
             return []
         if physical:
             # Clean basis (row cleared before we got here): the selected mask is
             # the full eviction set. Set the mask (hides blocks for the one-step
             # window) and report the indices for compaction.
-            mask = select_evicted_to_budget(
-                scores,
-                count,
-                low,
-                int(cfg.warmup_pages or 0),
-                cfg.eviction_policy,
-                cfg.eviction_seed,
-                cfg.query_tail_protect_frac,
-            )
+            with self.profiler.section("selection"):
+                mask = self._select_budget_mask(scores, count, budget, vnorm)
             if not bool(mask.any()):
                 return []
             self._num_decode_evictions += 1
             self.evicted_store[req_index, :count].copy_(
                 mask.to(self.evicted_store.device)
             )
+            self._stage_incremental_eviction(req_index, mask)
             return torch.nonzero(mask).flatten().tolist()
         # Mask-only A/B mode (no compaction ever lands to clear the row): never
         # re-keep an already-hidden block. For scored policies (v_redundancy,
@@ -699,15 +1405,21 @@ class EvictionPolicy:
         if bool(prev.any()):
             scores = scores.detach().to(device="cpu", dtype=torch.float32).clone()
             scores[prev] = float("inf")
-        mask = select_evicted_to_budget(
-            scores,
-            count,
-            low,
-            int(cfg.warmup_pages or 0),
-            cfg.eviction_policy,
-            cfg.eviction_seed,
-            cfg.query_tail_protect_frac,
-        )
+        # Phase-2 norm protection is intentionally not applied on this mask-only
+        # diagnostic path: the +inf forced re-selection of already-hidden blocks
+        # relies on the store only ever gaining True and holding the watermark, and
+        # protecting a prev-hidden block would fight that monotone invariant. Norm
+        # protection is a physical-reclaim feature (prefill + physical decode).
+        with self.profiler.section("selection"):
+            mask = select_evicted_to_budget(
+                scores,
+                count,
+                budget,
+                warmup,
+                cfg.eviction_policy,
+                cfg.eviction_seed,
+                cfg.query_tail_protect_frac,
+            )
         merged = mask | prev
         if bool((merged & ~prev).any()):
             self._num_decode_evictions += 1
@@ -723,3 +1435,7 @@ class EvictionPolicy:
             self._num_requests_evicted,
             self._num_decode_evictions,
         )
+        # Flush the Phase-1B scorer profile (no-op unless enable_tracing).
+        self.profiler.dump()
+        # Flush the Phase-1C layer-subset calibration (no-op unless enabled).
+        self.layer_calibrator.dump()

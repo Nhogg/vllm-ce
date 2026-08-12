@@ -38,6 +38,18 @@ EXPERIMENT_MODES = (
 )
 HEAD_REDUNDANCY_STATS = ("max", "topk_mean", "percentile_90")
 BLOCK_SCORE_AGGREGATIONS = ("mean", "max", "topk_mean", "percentile_90")
+# How v_redundancy ranks blocks: pairwise (score-once, the pinned default) or
+# greedy (iterative peel that protects the surviving twin of a duplicate pair).
+REDUNDANCY_MODES = ("pairwise", "greedy", "coverage")
+# How a whole KV block is represented before pairwise V-redundancy scoring.
+# ``mean`` is the pinned one-anchor scorer. The experimental multi-prototype
+# modes retain within-block structure while preserving whole-block eviction.
+BLOCK_PROTOTYPE_MODES = ("mean", "quarters", "mean_top2_norm")
+# How the value-L2 baseline collapses valid token/head norms into one physical
+# block importance. ``sum`` is the pinned get_block_score reproduction. The max
+# variants are experimental whole-block approximations to PagedEviction's much
+# finer token/head selection: one rare strong cell can protect its whole block.
+VALUE_L2_BLOCK_REDUCTIONS = ("sum", "max_token", "max_token_head")
 OVERFLOW_EVICTION_MODES = ("repeated_single",)
 # Milestone-1 (mask-only) eviction policies. v_redundancy is the thesis;
 # recency (drop-oldest) and random are the matched-count baselines; value_l2 is
@@ -72,6 +84,14 @@ class GeoKVConfig:
     score_sampled_layers: str = "all"
     score_sampled_kv_heads: str = "all"
 
+    # Diagnostic (plan Phase 1C): while scoring with ALL layers, also measure how
+    # well fixed 1/2/4-layer subsets reproduce the all-layer selected-block set
+    # (mean Jaccard), so a cheap universal subset can be picked without a full
+    # eval per subset. Off by default; requires score_sampled_layers=="all" and
+    # enable_tracing (writes <log_path>.layer_calibration.json). Adds a small
+    # per-fire overhead, so it is a calibration mode, not for production.
+    calibrate_layer_subsets: bool = False
+
     # Diagnostic: also score redundancy at the TOKEN level (no block pooling),
     # writing token_level_scores.csv. Off by default; only used in score_only.
     score_token_level: bool = False
@@ -97,6 +117,61 @@ class GeoKVConfig:
     block_score_aggregation: str = "percentile_90"
     # Fraction used by the "topk_mean" statistic/aggregation.
     topk_frac: float = 0.1
+
+    # How the v_redundancy score ranks blocks:
+    #   "pairwise" -- each block's max cosine to ANY other block, scored once
+    #     (the pinned thesis signal). Near-duplicate blocks BOTH score maximally
+    #     redundant, so a budget cut can drop both and lose the duplicated info.
+    #   "greedy" -- peel the most-redundant block one at a time, recomputing each
+    #     survivor's redundancy against the SURVIVING set only, so once one twin
+    #     is dropped its partner is protected (set-cover-correct). Encoded as an
+    #     eviction-order score consumed by the same argsort budget selector.
+    #   "coverage" -- aggregate similarity across layers first, then greedily
+    #     construct one global kept set that maximizes whole-request coverage at
+    #     the actual keep budget. This fixes the old greedy mode's independent
+    #     per-layer ordinal aggregation and duplicate-annihilation failure.
+    # Default "pairwise" == byte-identical to the pinned scorer. Applies only to
+    # eviction_policy="v_redundancy".
+    redundancy_mode: str = "pairwise"
+    # Representation used by pairwise V-redundancy:
+    #   mean -- current valid-token mean (one prototype; pinned behavior).
+    #   quarters -- four contiguous sub-block means.
+    #   mean_top2_norm -- the block mean plus its two highest-value-norm tokens.
+    # Multi-prototype modes make a block droppable only when every prototype is
+    # covered by another block, preventing a rare token from being cancelled by
+    # the block mean. They do not change the physical eviction unit. Experimental;
+    # default "mean" is byte-identical to the pinned scorer.
+    block_prototype_mode: str = "mean"
+    # Optional value-norm blend for v_redundancy: final droppability =
+    # zscore(redundancy) - value_blend_beta * zscore(value_L2_norm). Redundancy
+    # wins on span-finding tasks (multifieldqa); value-L2 wins on distributed-
+    # information tasks (summarization, dense QA). Both signals are standardized
+    # per request so beta is scale-free. A high-value-norm block becomes LESS
+    # droppable. None/0.0 == off (pure redundancy, byte-identical). Applies only
+    # to eviction_policy="v_redundancy".
+    value_blend_beta: float | None = None
+
+    # Norm-constrained redundancy (Phase 2): protect blocks whose aggregated
+    # value-L2 norm is at or above the ``value_norm_protect_quantile`` quantile
+    # (per request), then evict the highest-redundancy blocks from the REMAINING
+    # candidates. A hard protection constraint rather than the soft linear
+    # ``value_blend_beta``: value-L2 wins on distributed-information tasks
+    # (summarization, dense QA) while V-redundancy wins on span-finding
+    # (multifieldqa), and treating high value-norm as a keep-guard aims to capture
+    # both. Budget stays exact -- if too few candidates remain to reach the budget,
+    # protection is relaxed in ascending value-norm order (lowest-norm protected
+    # blocks first) until exactly ``k`` candidates are available. Sink / anchor /
+    # tail protection always take priority and are never relaxed. Quantile in
+    # [0, 1): 0.0 protects every block (fully relaxed back to budget), values near
+    # 1 protect only the top-norm blocks. None == off (byte-identical to the pinned
+    # scorer). Applies only to eviction_policy="v_redundancy".
+    value_norm_protect_quantile: float | None = None
+
+    # Within-block reduction for eviction_policy="value_l2". ``sum`` exactly
+    # preserves the existing baseline. The max modes retain rare high-norm
+    # token or token/head signal while the physical eviction unit stays a whole
+    # shared vLLM block. Non-default values are rejected for other policies.
+    value_l2_block_reduction: str = "sum"
 
     # Freeze prefill-derived layer/head weights during decode (frozen_emergent).
     freeze_after_prefill: bool = False
@@ -137,6 +212,14 @@ class GeoKVConfig:
     # larger values reduce scoring frequency further.
     decode_evict_interval: int = 1
 
+    # Cache copied block anchors and their pairwise cosine matrix across physical
+    # decode compactions.  On the next fire, only changed rows (normally the
+    # formerly-partial tail plus newly appended blocks) are read and multiplied.
+    # This is an exact optimization of the pinned pairwise/mean V-redundancy
+    # scorer, not a new policy.  Generation changes at compaction acknowledgement
+    # and request-slot reuse make physical-block reuse safe.  Off by default.
+    incremental_decode_scoring: bool = False
+
     # -- Decoupled per-end targets, expressed as a fraction of prompt blocks --
     # These decouple the two eviction ends so admission and decode can be tuned
     # independently (e.g. strict admission + lenient decode). They are resolved
@@ -156,16 +239,49 @@ class GeoKVConfig:
     # ``decode_evict_interval`` (throttle).
     decode_evict_frac: float | None = None
 
+    # -- Fixed-rate decode "drip" ------------------------------------------
+    # ``decode_evict_blocks_per_step``: instead of a watermark band, evict
+    # exactly N whole interior blocks on each decode-eviction fire (budget =
+    # count - N via select_evicted_to_budget). N is a drain *rate*, not a
+    # steady-state size: with no capacity gate the request drains monotonically
+    # toward the floor (warmup_pages sink + 1 anchor, plus any tail-protect).
+    # Distinct from and MUTUALLY EXCLUSIVE with the two watermark-band decode
+    # paths (decode_evict_frac / decode_evict_budget); COMPOSABLE with
+    # prefill_evict_frac (admission). Works off the live block count, never the
+    # per-request _decode_cap_np band. Reuses decode_evict_interval (throttle).
+    # Under physical_reclaim the in-flight compaction guard halves the effective
+    # cadence to ~N blocks per 2 steps (still exactly N per fire). None disables.
+    decode_evict_blocks_per_step: int | None = None
+
+    # -- Pressure gate on the fixed-rate drip ------------------------------
+    # ``decode_evict_pressure_watermark``: gate the drip on GLOBAL cache pressure
+    # instead of firing on a fixed schedule. A FILL threshold in (0, 1): the drip
+    # only fires on a decode step when the global KV pool is >= this fraction full
+    # (used_fraction >= watermark). Below the threshold on_decode_step is a no-op
+    # for every request, so short / low-pressure generations pay nothing. This is
+    # a MODIFIER on the drip, not its own mechanism: it REQUIRES
+    # decode_evict_blocks_per_step (the N it gates). The global free fraction is a
+    # scheduler-side signal plumbed to the worker via SchedulerOutput. None
+    # disables the gate -> the drip fires unconditionally (legacy behavior).
+    decode_evict_pressure_watermark: float | None = None
+
     # Output location for score_only artifacts (CSV/JSON). Optional.
     output_dir: str | None = None
     run_id: str | None = None
     # Free-form dataset label recorded in the CSV (e.g. "synthetic_fixed").
     dataset: str | None = None
 
-    # Optional query-alignment tie-break knobs (used by later phases only).
+    # Actual query-to-key relevance refinement. When enabled, the engine
+    # captures up to the final ``query_tail_tokens`` observed post-RoPE queries
+    # on the sampled scoring layers and lowers droppability for blocks receiving
+    # high causal QK attention mass. With prefix caching, the observed uncached
+    # suffix is used against the complete visible K cache. A positive weight uses
+    # per-request z-scored signals; tiebreak mode only separates equal redundancy
+    # scores. Both are inert by default and apply only to v_redundancy.
     query_ema_beta: float | None = None
     query_alignment_weight: float | None = None
     enable_query_tiebreak: bool = False
+    query_tail_tokens: int = 32
     # Tail-protect (recency floor) for the budget path: never V-evict the last
     # ``ceil(query_tail_protect_frac * num_blocks)`` blocks of a request. The
     # question sits at the prompt tail in every LongBench template, so query-
@@ -175,6 +291,16 @@ class GeoKVConfig:
     # matched: the protected count is clamped so exactly enough interior blocks are
     # still dropped to reach budget.
     query_tail_protect_frac: float | None = None
+    # Positional cosh (sech-bump) re-weighting of v_redundancy droppability.
+    # Multiply each block's droppability by ``1/cosh(alpha * x)`` where ``x``
+    # maps the block's position over the evictable span to ``[-1, 1]`` (ends at
+    # +/-1, middle at 0). ``sech`` peaks at the middle and decays toward the
+    # ends, so a larger multiplier lands on interior blocks: eviction is pulled
+    # toward the middle and away from the sink/tail, a smooth analog of the
+    # hard ``query_tail_protect_frac`` guard. Applied only to ``v_redundancy``
+    # (the scored thesis signal); ignored by recency/random and by value_l2.
+    # None/0.0 == off (byte-identical to the pinned scorer). Must be >= 0.
+    positional_cosh_alpha: float | None = None
 
     @property
     def enabled(self) -> bool:
@@ -204,6 +330,10 @@ class GeoKVConfig:
             "attention_budget",
             "proxy_attention_budget",
         )
+
+    @property
+    def query_relevance_enabled(self) -> bool:
+        return bool(self.query_alignment_weight) or self.enable_query_tiebreak
 
     # -- construction -------------------------------------------------------
     @classmethod
@@ -258,6 +388,19 @@ class GeoKVConfig:
             OVERFLOW_EVICTION_MODES,
         )
         _check_choice("eviction_policy", self.eviction_policy, EVICTION_POLICIES)
+        _check_choice(
+            "value_l2_block_reduction",
+            self.value_l2_block_reduction,
+            VALUE_L2_BLOCK_REDUCTIONS,
+        )
+        if (
+            self.value_l2_block_reduction != "sum"
+            and self.eviction_policy != "value_l2"
+        ):
+            raise ValueError(
+                "geo_kv.value_l2_block_reduction requires "
+                "eviction_policy='value_l2' when non-default"
+            )
         _check_index_spec("score_sampled_layers", self.score_sampled_layers)
         _check_index_spec("score_sampled_kv_heads", self.score_sampled_kv_heads)
 
@@ -295,6 +438,11 @@ class GeoKVConfig:
                 )
         # Decoupled fraction-of-prompt targets. Each is independent; when either
         # is set it uses the same policy/mode requirements as the budget path.
+        # eviction_policy selects WHICH blocks the band drops: v_redundancy
+        # (scored, the thesis), recency (oldest-first == StreamingLLM baseline at
+        # matched memory), random, or value_l2 (the Paged-Eviction contrast). All
+        # are honored by select_evicted_to_budget, so no policy restriction here
+        # -- exactly as on the coupled decode_evict_budget path above.
         for _name, _frac in (
             ("prefill_evict_frac", self.prefill_evict_frac),
             ("decode_evict_frac", self.decode_evict_frac),
@@ -303,11 +451,6 @@ class GeoKVConfig:
                 continue
             if not (0.0 < _frac <= 1.0):
                 raise ValueError(f"geo_kv.{_name} must be in (0, 1]")
-            if self.eviction_policy != "v_redundancy":
-                raise ValueError(
-                    f"geo_kv.{_name} currently requires "
-                    "eviction_policy='v_redundancy' (the core thesis signal)"
-                )
             if not self.active_eviction:
                 raise ValueError(
                     f"geo_kv.{_name} requires an active_eviction experiment_mode"
@@ -321,6 +464,45 @@ class GeoKVConfig:
                 "geo_kv.decode_evict_watermark must be in (0, 1) "
                 "(the low-watermark fraction of the decode capacity)"
             )
+        # Fixed-rate decode drip: exactly one decode mechanism may be active.
+        if self.decode_evict_blocks_per_step is not None:
+            if self.decode_evict_blocks_per_step < 1:
+                raise ValueError("geo_kv.decode_evict_blocks_per_step must be >= 1")
+            if (
+                self.decode_evict_frac is not None
+                or self.decode_evict_budget is not None
+            ):
+                raise ValueError(
+                    "geo_kv.decode_evict_blocks_per_step is mutually exclusive "
+                    "with decode_evict_frac and decode_evict_budget "
+                    "(pick one decode eviction mechanism)"
+                )
+            if self.eviction_policy != "v_redundancy":
+                raise ValueError(
+                    "geo_kv.decode_evict_blocks_per_step currently requires "
+                    "eviction_policy='v_redundancy' (the core thesis signal)"
+                )
+            if not self.active_eviction:
+                raise ValueError(
+                    "geo_kv.decode_evict_blocks_per_step requires an "
+                    "active_eviction experiment_mode"
+                )
+            if self.decode_evict_interval < 1:
+                raise ValueError("geo_kv.decode_evict_interval must be >= 1")
+        # Pressure gate on the drip: a FILL threshold that decides WHEN the drip
+        # may fire; it is not a standalone mechanism, so it requires the drip N.
+        if self.decode_evict_pressure_watermark is not None:
+            if not (0.0 < self.decode_evict_pressure_watermark < 1.0):
+                raise ValueError(
+                    "geo_kv.decode_evict_pressure_watermark must be in (0, 1) "
+                    "(the global cache FILL fraction at which the drip fires)"
+                )
+            if self.decode_evict_blocks_per_step is None:
+                raise ValueError(
+                    "geo_kv.decode_evict_pressure_watermark requires "
+                    "decode_evict_blocks_per_step (it gates the fixed-rate drip; "
+                    "it is not a standalone eviction mechanism)"
+                )
         if self.query_tail_protect_frac is not None and not (
             0.0 <= self.query_tail_protect_frac < 1.0
         ):
@@ -328,6 +510,116 @@ class GeoKVConfig:
                 "geo_kv.query_tail_protect_frac must be in [0, 1) "
                 "(fraction of trailing blocks protected from V-eviction)"
             )
+        if self.query_alignment_weight is not None and self.query_alignment_weight < 0:
+            raise ValueError("geo_kv.query_alignment_weight must be >= 0")
+        if self.query_tail_tokens < 1:
+            raise ValueError("geo_kv.query_tail_tokens must be >= 1")
+        if self.query_relevance_enabled:
+            if self.eviction_policy != "v_redundancy":
+                raise ValueError(
+                    "geo_kv query relevance requires "
+                    "eviction_policy='v_redundancy'"
+                )
+            if not self.active_eviction:
+                raise ValueError(
+                    "geo_kv query relevance requires an active_eviction "
+                    "experiment_mode"
+                )
+            if self.calibrate_layer_subsets:
+                raise ValueError(
+                    "geo_kv query relevance is incompatible with "
+                    "calibrate_layer_subsets; calibrate the base layer subset "
+                    "first, then evaluate query relevance on that fixed subset"
+                )
+        if self.positional_cosh_alpha is not None and self.positional_cosh_alpha < 0.0:
+            raise ValueError(
+                "geo_kv.positional_cosh_alpha must be >= 0 "
+                "(sech-bump steepness; 0 == off)"
+            )
+        _check_choice("redundancy_mode", self.redundancy_mode, REDUNDANCY_MODES)
+        _check_choice(
+            "block_prototype_mode",
+            self.block_prototype_mode,
+            BLOCK_PROTOTYPE_MODES,
+        )
+        if self.redundancy_mode == "greedy" and self.block_prototype_mode != "mean":
+            raise ValueError(
+                "geo_kv.block_prototype_mode currently requires "
+                "redundancy_mode='pairwise' unless it is 'mean'"
+            )
+        if self.redundancy_mode == "coverage":
+            decode_active = (
+                self.decode_evict_budget is not None
+                or self.decode_evict_frac is not None
+                or self.decode_evict_blocks_per_step is not None
+            )
+            if self.eviction_policy != "v_redundancy":
+                raise ValueError(
+                    "geo_kv.redundancy_mode='coverage' requires "
+                    "eviction_policy='v_redundancy'"
+                )
+            if self.block_prototype_mode != "mean":
+                raise ValueError(
+                    "geo_kv.redundancy_mode='coverage' currently requires "
+                    "block_prototype_mode='mean'"
+                )
+            if (
+                self.value_blend_beta
+                or self.value_norm_protect_quantile is not None
+                or self.query_relevance_enabled
+                or self.calibrate_layer_subsets
+                or bool(self.positional_cosh_alpha)
+            ):
+                raise ValueError(
+                    "geo_kv.redundancy_mode='coverage' is incompatible with "
+                    "value/query refinements and layer calibration"
+                )
+            if decode_active and not self.physical_reclaim:
+                raise ValueError(
+                    "geo_kv.redundancy_mode='coverage' requires physical_reclaim "
+                    "when decode eviction is active"
+                )
+        if self.value_blend_beta is not None and self.value_blend_beta < 0.0:
+            raise ValueError(
+                "geo_kv.value_blend_beta must be >= 0 "
+                "(value-norm blend weight; 0/None == off)"
+            )
+        if self.value_norm_protect_quantile is not None and not (
+            0.0 <= self.value_norm_protect_quantile < 1.0
+        ):
+            raise ValueError(
+                "geo_kv.value_norm_protect_quantile must be in [0, 1) "
+                "(value-norm protection quantile; None == off)"
+            )
+        if self.incremental_decode_scoring:
+            decode_active = (
+                self.decode_evict_budget is not None
+                or self.decode_evict_frac is not None
+                or self.decode_evict_blocks_per_step is not None
+            )
+            if not self.physical_reclaim or not decode_active:
+                raise ValueError(
+                    "geo_kv.incremental_decode_scoring requires physical_reclaim "
+                    "and an active decode eviction mechanism"
+                )
+            if (
+                self.eviction_policy != "v_redundancy"
+                or self.redundancy_mode != "pairwise"
+                or self.block_prototype_mode != "mean"
+            ):
+                raise ValueError(
+                    "geo_kv.incremental_decode_scoring currently requires "
+                    "pairwise mean-prototype eviction_policy='v_redundancy'"
+                )
+            if (
+                self.value_blend_beta
+                or self.value_norm_protect_quantile is not None
+                or self.query_relevance_enabled
+            ):
+                raise ValueError(
+                    "geo_kv.incremental_decode_scoring is incompatible with "
+                    "value-norm and query-relevance refinements"
+                )
         if not (0.0 < self.topk_frac <= 1.0):
             raise ValueError("geo_kv.topk_frac must be in (0, 1]")
         if self.token_sample_cap < 2:
@@ -387,15 +679,20 @@ def _check_index_spec(name: str, spec: str) -> None:
         )
 
 
-def resolve_indices(spec: str, n: int) -> list[int]:
+def resolve_indices(spec: str, n: int, *, strict: bool = False) -> list[int]:
     """Resolve a validated index spec into concrete indices in ``[0, n)``.
 
     Args:
         spec: "all", "last", or a comma-separated list of non-negative ints.
         n: The size of the dimension being sampled.
+        strict: Raise when an explicit index is outside ``[0, n)`` instead of
+            silently dropping it. Runtime scorers should use this so a layer
+            subset calibrated for a different architecture cannot quietly turn
+            into a smaller subset.
 
     Returns:
-        Sorted, de-duplicated indices; out-of-range entries are dropped.
+        Sorted, de-duplicated indices. Out-of-range entries are dropped unless
+        ``strict`` is true.
     """
     if n <= 0:
         return []
@@ -404,4 +701,10 @@ def resolve_indices(spec: str, n: int) -> list[int]:
     if spec == "last":
         return [n - 1]
     idxs = {int(p.strip()) for p in spec.split(",") if p.strip() != ""}
+    invalid = sorted(i for i in idxs if not 0 <= i < n)
+    if strict and invalid:
+        raise ValueError(
+            f"geo_kv index spec {spec!r} contains out-of-range indices "
+            f"{invalid} for a dimension of size {n}"
+        )
     return sorted(i for i in idxs if 0 <= i < n)

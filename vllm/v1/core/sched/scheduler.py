@@ -950,6 +950,14 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
+            # Pre-forward snapshot of global KV pressure for the worker's geo_kv
+            # eviction gate. One-step-latent w.r.t. this step's own eviction
+            # relief (like total_num_scheduled_tokens); the in-flight compaction
+            # guard prevents over-eviction.
+            kv_cache_free_fraction=(
+                self.kv_cache_manager.block_pool.get_num_free_blocks()
+                / self.kv_cache_manager.block_pool.num_gpu_blocks
+            ),
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:

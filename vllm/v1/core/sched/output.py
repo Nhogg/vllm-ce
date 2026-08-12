@@ -246,6 +246,13 @@ class SchedulerOutput:
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
 
+    # Global KV-cache free fraction (free_blocks / num_gpu_blocks) sampled when
+    # this step was scheduled. A scheduler-side signal the worker uses to gate
+    # pressure-triggered geo_kv decode eviction. Defaults to 0.0 (== pool full)
+    # so make_empty()/dummy steps carry a safe value; the geo hook only reads it
+    # when a pressure watermark is configured.
+    kv_cache_free_fraction: float = 0.0
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

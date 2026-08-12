@@ -76,6 +76,8 @@ def _make_policy(
     warmup_pages: int = 1,
     physical: bool = True,
     interval: int = 1,
+    incremental: bool = False,
+    redundancy_mode: str = "pairwise",
 ) -> EvictionPolicy:
     cfg = GeoKVConfig.from_dict(
         {
@@ -88,6 +90,8 @@ def _make_policy(
             "decode_evict_watermark": watermark,
             "decode_evict_interval": interval,
             "physical_reclaim": physical,
+            "incremental_decode_scoring": incremental,
+            "redundancy_mode": redundancy_mode,
         }
     )
     kv = {"l0": torch.randn(NUM_GPU_BLOCKS, 2, BLOCK_SIZE, H, D)}
@@ -199,6 +203,7 @@ def _apply_compaction(
     # Reuse the reserved pool: survivors occupy the first `survivors` slots; the
     # tail of the pool is available for regrowth.
     _place(bt, req_index, survivors)
+    policy.on_compaction_applied(req_index, survivors)
     policy.num_evicted_tokens_np[req_index] += len(freed_set) * BLOCK_SIZE
     policy.evicted_store[req_index].zero_()
 
@@ -404,6 +409,23 @@ def test_decode_at_capacity_evicts_and_counts():
     assert policy._num_decode_evictions == 1
 
 
+def test_global_coverage_mode_runs_end_to_end_at_exact_budget():
+    policy = _make_policy(redundancy_mode="coverage")
+    bt = _make_block_tables()
+    _place(bt, 0, CAP)
+
+    freed = policy.on_decode_step(
+        _decode_batch(["r0"], [0], [CAP * BLOCK_SIZE]), bt
+    )
+
+    _, low = capacity_band(policy.config)
+    assert len(freed["r0"]) == CAP - low
+    assert 0 not in freed["r0"]
+    assert CAP - 1 not in freed["r0"]
+    assert policy._coverage_similarity is not None
+    assert policy._coverage_similarity.shape == (CAP, CAP)
+
+
 def test_decode_in_flight_guard_blocks_refire():
     """A pending compaction (store row set) must suppress decode eviction."""
     policy = _make_policy()
@@ -506,6 +528,77 @@ def test_hysteresis_full_cycle():
     _apply_compaction(policy, bt, 0, freed2["r0"])
     assert _count(bt, 0) == low
     assert _store_true(policy, 0) == 0
+
+
+def test_incremental_scoring_matches_full_across_compaction_and_slot_reuse():
+    """Phase-6 state must preserve the selected set across a real lifecycle.
+
+    The second fire deliberately reuses the just-freed physical ids after
+    replacing their KV contents.  Generation pruning must treat them as new tail
+    rows, while retaining survivor metadata without referencing the old slots.
+    """
+    full = _make_policy()
+    incremental = _make_policy(incremental=True)
+    incremental.kv["l0"].copy_(full.kv["l0"])
+    full_bt = _make_block_tables()
+    incremental_bt = _make_block_tables()
+    _place(full_bt, 0, CAP)
+    _place(incremental_bt, 0, CAP)
+
+    batch = _decode_batch(["r0"], [0], [CAP * BLOCK_SIZE])
+    full_freed = full.on_decode_step(batch, full_bt)["r0"]
+    incremental_freed = incremental.on_decode_step(batch, incremental_bt)["r0"]
+    assert incremental_freed == full_freed
+
+    old_ids = _reserved(0)[:CAP]
+    freed_set = set(full_freed)
+    survivor_ids = [
+        block_id for i, block_id in enumerate(old_ids) if i not in freed_set
+    ]
+    reused_ids = [old_ids[i] for i in full_freed]
+    next_ids = survivor_ids + reused_ids
+    assert len(next_ids) == CAP
+
+    # Land the compacted survivor row first, which is the authoritative ack.
+    for policy, bt in ((full, full_bt), (incremental, incremental_bt)):
+        bt.block_tables[0].gpu[0, : len(survivor_ids)] = torch.tensor(survivor_ids)
+        bt.num_blocks.np[0, 0] = len(survivor_ids)
+        policy.on_compaction_applied(0, len(survivor_ids))
+        policy.evicted_store[0].zero_()
+        policy.num_evicted_tokens_np[0] += len(full_freed) * BLOCK_SIZE
+
+    # Simulate allocator reuse plus decode writes into the freed physical slots.
+    fresh = torch.randn(len(reused_ids), 2, BLOCK_SIZE, H, D)
+    for policy in (full, incremental):
+        policy.kv["l0"][torch.tensor(reused_ids)] = fresh
+    for bt in (full_bt, incremental_bt):
+        bt.block_tables[0].gpu[0, :CAP] = torch.tensor(next_ids)
+        bt.num_blocks.np[0, 0] = CAP
+
+    total_seq_len = CAP * BLOCK_SIZE + len(full_freed) * BLOCK_SIZE
+    second = _decode_batch(["r0"], [0], [total_seq_len])
+    full_second = full.on_decode_step(second, full_bt)["r0"]
+    incremental_second = incremental.on_decode_step(second, incremental_bt)["r0"]
+
+    assert incremental_second == full_second
+    state = incremental._incremental_states[0][0]
+    assert state.num_blocks == CAP
+    assert state.generation == 1
+
+
+def test_incremental_state_is_released_on_request_reset():
+    policy = _make_policy(incremental=True)
+    bt = _make_block_tables()
+    _place(bt, 0, CAP)
+    assert policy._score_request_blocks(0, CAP * BLOCK_SIZE, bt) is not None
+    assert 0 in policy._incremental_states
+    generation = int(policy._incremental_generation_np[0])
+
+    policy.reset_request(0)
+
+    assert 0 not in policy._incremental_states
+    assert 0 not in policy._incremental_pending_masks
+    assert int(policy._incremental_generation_np[0]) == generation + 1
 
 
 def test_no_refire_until_compaction_applied():
@@ -690,3 +783,424 @@ def test_frac_path_takes_precedence_over_legacy_budget():
     _admit(policy, bt, 0, P)
     # The band came from the fraction (cap=4), not any global budget.
     assert int(policy._decode_cap_np[0]) == frac_band(0.5, 0.75, P)[0]
+
+
+# ===========================================================================
+# Fixed-rate decode "drip": evict exactly N interior blocks per fire
+# ===========================================================================
+def _make_drip_policy(
+    *,
+    blocks_per_step: int,
+    prefill_evict_frac: float | None = None,
+    warmup_pages: int = 1,
+    physical: bool = True,
+    interval: int = 1,
+) -> EvictionPolicy:
+    """A policy on the fixed-rate drip path (no band; optional strict admission)."""
+    raw: dict = {
+        "experiment_mode": "geo_uniform",
+        "eviction_policy": "v_redundancy",
+        "score_sampled_layers": "all",
+        "block_score_aggregation": "mean",
+        "warmup_pages": warmup_pages,
+        "decode_evict_interval": interval,
+        "decode_evict_blocks_per_step": blocks_per_step,
+        "physical_reclaim": physical,
+    }
+    if prefill_evict_frac is not None:
+        raw["prefill_evict_frac"] = prefill_evict_frac
+    cfg = GeoKVConfig.from_dict(raw)
+    kv = {"l0": torch.randn(NUM_GPU_BLOCKS, 2, BLOCK_SIZE, H, D)}
+    groups = [
+        KVCacheGroupSpec(
+            layer_names=["l0"],
+            kv_cache_spec=FullAttentionSpec(
+                block_size=BLOCK_SIZE, num_kv_heads=H, head_size=D, dtype=torch.float32
+            ),
+        )
+    ]
+    evicted_store = torch.zeros(MAX_REQS, MAX_BLOCKS, dtype=torch.bool)
+    num_evicted_tokens_np = np.zeros(MAX_REQS, dtype=np.int32)
+    return EvictionPolicy(
+        cfg,
+        kv,
+        groups,
+        evicted_store,
+        BLOCK_SIZE,
+        torch.device("cpu"),
+        num_evicted_tokens_np,
+    )
+
+
+@pytest.mark.parametrize("n", [1, 2, 4])
+def test_drip_evicts_exactly_n_per_fire(n):
+    """Each fire frees exactly N blocks (no capacity gate), off the live count."""
+    policy = _make_drip_policy(blocks_per_step=n)
+    bt = _make_block_tables()
+    _place(bt, 0, P)  # full prompt admitted, way above any floor
+    freed = policy.on_decode_step(_decode_batch(["r0"], [0], [P * BLOCK_SIZE]), bt)
+
+    assert set(freed) == {"r0"}
+    assert len(freed["r0"]) == n
+    assert policy._num_decode_evictions == 1
+    # Drip never touches the per-request frac band arrays.
+    assert int(policy._decode_cap_np[0]) == 0
+    assert int(policy._decode_low_np[0]) == 0
+
+
+def test_drip_fires_below_any_capacity():
+    """Unlike the band path, the drip has no C gate: it fires even for a small
+    request, as long as an interior block exists above the floor."""
+    policy = _make_drip_policy(blocks_per_step=2)
+    bt = _make_block_tables()
+    _place(bt, 0, 5)  # 5 blocks: sink(1) + anchor(1) + 3 interior
+    freed = policy.on_decode_step(_decode_batch(["r0"], [0], [5 * BLOCK_SIZE]), bt)
+
+    assert set(freed) == {"r0"}
+    assert len(freed["r0"]) == 2
+    assert policy._num_decode_evictions == 1
+
+
+def test_drip_last_fire_clamps_to_remainder():
+    """When fewer than N evictable blocks remain, drop only what's left."""
+    warmup = 1
+    policy = _make_drip_policy(blocks_per_step=4, warmup_pages=warmup)
+    bt = _make_block_tables()
+    # 4 blocks: sink(1) + anchor(1) + 2 interior evictable; N=4 clamps to 2.
+    _place(bt, 0, 4)
+    freed = policy.on_decode_step(_decode_batch(["r0"], [0], [4 * BLOCK_SIZE]), bt)
+
+    assert set(freed) == {"r0"}
+    assert len(freed["r0"]) == 2  # clamped to the evictable window
+    assert policy._num_decode_evictions == 1
+
+
+def test_drip_terminates_at_floor():
+    """Repeated fire -> compact drains to the floor (warmup sink + anchor), then
+    stops firing (no exception, no phantom eviction)."""
+    warmup = 1
+    n = 2
+    policy = _make_drip_policy(blocks_per_step=n, warmup_pages=warmup)
+    bt = _make_block_tables()
+    start = P  # 8
+    _place(bt, 0, start)
+
+    seq = start * BLOCK_SIZE
+    fires = 0
+    for _ in range(20):
+        freed = policy.on_decode_step(_decode_batch(["r0"], [0], [seq]), bt)
+        if not freed:
+            break
+        fires += 1
+        _apply_compaction(policy, bt, 0, freed["r0"])
+        seq += BLOCK_SIZE  # decode keeps appending tokens (uncompacted growth)
+
+    floor = warmup + 1  # sink + anchor
+    assert _count(bt, 0) == floor
+    # Started at 8, floor 2, drip 2/fire -> 3 fires (2->... last clamps if needed).
+    assert fires == math.ceil((start - floor) / n)
+    # A further step at the floor is a clean no-op (returns before scoring).
+    assert policy.on_decode_step(_decode_batch(["r0"], [0], [seq]), bt) == {}
+
+
+def test_drip_physical_cadence_n_per_two_steps():
+    """Under physical reclaim the in-flight guard suppresses the fire on the step
+    after a fire, until the compaction lands -> effective cadence N per 2 steps."""
+    policy = _make_drip_policy(blocks_per_step=2, physical=True)
+    bt = _make_block_tables()
+    _place(bt, 0, P)
+    seq = P * BLOCK_SIZE
+
+    # Step 1: fires.
+    freed = policy.on_decode_step(_decode_batch(["r0"], [0], [seq]), bt)
+    assert set(freed) == {"r0"}
+    assert policy._num_decode_evictions == 1
+
+    # Step 2: store row still set (compaction pending) -> no-op via in-flight guard.
+    assert policy.on_decode_step(_decode_batch(["r0"], [0], [seq]), bt) == {}
+    assert policy._num_decode_evictions == 1
+
+    # Compaction lands -> row clears -> next step fires again.
+    _apply_compaction(policy, bt, 0, freed["r0"])
+    freed2 = policy.on_decode_step(_decode_batch(["r0"], [0], [seq]), bt)
+    assert set(freed2) == {"r0"}
+    assert policy._num_decode_evictions == 2
+
+
+def test_drip_composes_with_prefill_frac():
+    """Stage B path: strict admission (prefill_evict_frac) THEN a decode drip off
+    the compacted row."""
+    policy = _make_drip_policy(blocks_per_step=1, prefill_evict_frac=0.5)
+    bt = _make_block_tables()
+
+    keep = math.ceil(0.5 * P)  # 4
+    freed = _admit(policy, bt, 0, P)
+    assert len(freed["r0"]) == P - keep
+    _apply_compaction(policy, bt, 0, freed["r0"])
+    assert _count(bt, 0) == keep
+
+    # Now decode drips 1 block off the compacted row.
+    freed2 = policy.on_decode_step(
+        _decode_batch(["r0"], [0], [(P + (P - keep)) * BLOCK_SIZE]), bt
+    )
+    assert set(freed2) == {"r0"}
+    assert len(freed2["r0"]) == 1
+
+
+def test_drip_tiny_request_noop():
+    """A request already at/under the floor never fires (no scoring)."""
+    policy = _make_drip_policy(blocks_per_step=2, warmup_pages=1)
+    bt = _make_block_tables()
+    _place(bt, 0, 2)  # sink + anchor only == floor
+    assert policy.on_decode_step(_decode_batch(["r0"], [0], [2 * BLOCK_SIZE]), bt) == {}
+    assert policy._num_decode_evictions == 0
+
+
+# --- config validation: exactly one decode mechanism -----------------------
+def test_config_drip_rejects_coset_decode_frac():
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        GeoKVConfig.from_dict(
+            {
+                "experiment_mode": "geo_uniform",
+                "eviction_policy": "v_redundancy",
+                "decode_evict_blocks_per_step": 2,
+                "decode_evict_frac": 0.5,
+            }
+        )
+
+
+def test_config_drip_rejects_coset_decode_budget():
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        GeoKVConfig.from_dict(
+            {
+                "experiment_mode": "geo_uniform",
+                "eviction_policy": "v_redundancy",
+                "decode_evict_blocks_per_step": 2,
+                "decode_evict_budget": 8,
+            }
+        )
+
+
+def test_config_drip_rejects_non_v_redundancy():
+    with pytest.raises(ValueError, match="v_redundancy"):
+        GeoKVConfig.from_dict(
+            {
+                "experiment_mode": "geo_uniform",
+                "eviction_policy": "recency",
+                "decode_evict_blocks_per_step": 2,
+            }
+        )
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_config_drip_rejects_nonpositive(bad):
+    with pytest.raises(ValueError, match="must be >= 1"):
+        GeoKVConfig.from_dict(
+            {
+                "experiment_mode": "geo_uniform",
+                "eviction_policy": "v_redundancy",
+                "decode_evict_blocks_per_step": bad,
+            }
+        )
+
+
+def test_config_drip_composes_with_prefill_frac_ok():
+    """Drip + prefill_evict_frac is a valid combination (Stage B)."""
+    cfg = GeoKVConfig.from_dict(
+        {
+            "experiment_mode": "geo_uniform",
+            "eviction_policy": "v_redundancy",
+            "decode_evict_blocks_per_step": 2,
+            "prefill_evict_frac": 0.5,
+        }
+    )
+    assert cfg.decode_evict_blocks_per_step == 2
+    assert cfg.prefill_evict_frac == 0.5
+
+
+# --- pressure-gated drip (Stage C) -----------------------------------------
+def _make_pressure_policy(
+    *,
+    blocks_per_step: int,
+    pressure_watermark: float,
+    warmup_pages: int = 1,
+    physical: bool = True,
+) -> EvictionPolicy:
+    """A policy on the drip path gated by a global-pressure FILL watermark."""
+    cfg = GeoKVConfig.from_dict(
+        {
+            "experiment_mode": "geo_uniform",
+            "eviction_policy": "v_redundancy",
+            "score_sampled_layers": "all",
+            "block_score_aggregation": "mean",
+            "warmup_pages": warmup_pages,
+            "decode_evict_interval": 1,
+            "decode_evict_blocks_per_step": blocks_per_step,
+            "decode_evict_pressure_watermark": pressure_watermark,
+            "physical_reclaim": physical,
+        }
+    )
+    kv = {"l0": torch.randn(NUM_GPU_BLOCKS, 2, BLOCK_SIZE, H, D)}
+    groups = [
+        KVCacheGroupSpec(
+            layer_names=["l0"],
+            kv_cache_spec=FullAttentionSpec(
+                block_size=BLOCK_SIZE, num_kv_heads=H, head_size=D, dtype=torch.float32
+            ),
+        )
+    ]
+    evicted_store = torch.zeros(MAX_REQS, MAX_BLOCKS, dtype=torch.bool)
+    num_evicted_tokens_np = np.zeros(MAX_REQS, dtype=np.int32)
+    return EvictionPolicy(
+        cfg,
+        kv,
+        groups,
+        evicted_store,
+        BLOCK_SIZE,
+        torch.device("cpu"),
+        num_evicted_tokens_np,
+    )
+
+
+def test_pressure_gate_blocks_below_watermark():
+    """Below the FILL watermark (plenty free) the drip is a no-op for every req."""
+    policy = _make_pressure_policy(blocks_per_step=2, pressure_watermark=0.9)
+    bt = _make_block_tables()
+    _place(bt, 0, P)  # well above the floor: would fire if pressure allowed
+    # 50% used < 90% watermark -> gated off.
+    freed = policy.on_decode_step(
+        _decode_batch(["r0"], [0], [P * BLOCK_SIZE]), bt, cache_free_fraction=0.5
+    )
+    assert freed == {}
+    assert policy._num_decode_evictions == 0
+
+
+def test_pressure_gate_fires_at_watermark():
+    """At/above the FILL watermark the gate opens and the drip drops exactly N."""
+    policy = _make_pressure_policy(blocks_per_step=2, pressure_watermark=0.9)
+    bt = _make_block_tables()
+    _place(bt, 0, P)
+    # 5% free -> 95% used >= 90% watermark -> fires.
+    freed = policy.on_decode_step(
+        _decode_batch(["r0"], [0], [P * BLOCK_SIZE]), bt, cache_free_fraction=0.05
+    )
+    assert set(freed) == {"r0"}
+    assert len(freed["r0"]) == 2
+    assert policy._num_decode_evictions == 1
+
+
+def test_pressure_gate_boundary_is_inclusive():
+    """used == watermark fires (>= comparison), used just under does not."""
+    policy = _make_pressure_policy(blocks_per_step=1, pressure_watermark=0.8)
+    bt = _make_block_tables()
+    _place(bt, 0, P)
+    # used == 0.8 exactly -> fires.
+    freed = policy.on_decode_step(
+        _decode_batch(["r0"], [0], [P * BLOCK_SIZE]), bt, cache_free_fraction=0.2
+    )
+    assert set(freed) == {"r0"}
+    # Fresh policy, just under the watermark -> no-op.
+    policy2 = _make_pressure_policy(blocks_per_step=1, pressure_watermark=0.8)
+    bt2 = _make_block_tables()
+    _place(bt2, 0, P)
+    freed2 = policy2.on_decode_step(
+        _decode_batch(["r0"], [0], [P * BLOCK_SIZE]), bt2, cache_free_fraction=0.201
+    )
+    assert freed2 == {}
+
+
+def test_pressure_gate_missing_signal_treated_as_full():
+    """cache_free_fraction=None => pool full => the gate opens (fires)."""
+    policy = _make_pressure_policy(blocks_per_step=2, pressure_watermark=0.9)
+    bt = _make_block_tables()
+    _place(bt, 0, P)
+    freed = policy.on_decode_step(
+        _decode_batch(["r0"], [0], [P * BLOCK_SIZE]), bt, cache_free_fraction=None
+    )
+    assert set(freed) == {"r0"}
+    assert len(freed["r0"]) == 2
+
+
+def test_pressure_unset_drip_still_unconditional():
+    """No pressure watermark => the drip fires regardless of free fraction (the
+    signal is ignored), preserving legacy unconditional-drip behavior."""
+    policy = _make_drip_policy(blocks_per_step=2)  # no pressure watermark
+    bt = _make_block_tables()
+    _place(bt, 0, P)
+    # Pass a wide-open pool (0% used); the drip must still fire.
+    freed = policy.on_decode_step(
+        _decode_batch(["r0"], [0], [P * BLOCK_SIZE]), bt, cache_free_fraction=1.0
+    )
+    assert set(freed) == {"r0"}
+    assert len(freed["r0"]) == 2
+
+
+def test_config_pressure_requires_drip():
+    """A pressure watermark without the drip N is rejected (not standalone)."""
+    with pytest.raises(ValueError, match="requires decode_evict_blocks_per_step"):
+        GeoKVConfig.from_dict(
+            {
+                "experiment_mode": "geo_uniform",
+                "eviction_policy": "v_redundancy",
+                "decode_evict_pressure_watermark": 0.9,
+            }
+        )
+
+
+@pytest.mark.parametrize("bad", [0.0, 1.0, -0.1, 1.5])
+def test_config_pressure_out_of_range(bad):
+    with pytest.raises(ValueError, match=r"must be in \(0, 1\)"):
+        GeoKVConfig.from_dict(
+            {
+                "experiment_mode": "geo_uniform",
+                "eviction_policy": "v_redundancy",
+                "decode_evict_blocks_per_step": 2,
+                "decode_evict_pressure_watermark": bad,
+            }
+        )
+
+
+def test_config_pressure_with_frac_band_rejected():
+    """Pressure gates the drip, and the drip is mutually exclusive with the frac
+    band, so pressure + frac band is transitively rejected."""
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        GeoKVConfig.from_dict(
+            {
+                "experiment_mode": "geo_uniform",
+                "eviction_policy": "v_redundancy",
+                "decode_evict_blocks_per_step": 2,
+                "decode_evict_pressure_watermark": 0.9,
+                "decode_evict_frac": 0.5,
+            }
+        )
+
+
+def test_config_pressure_composes_with_prefill_frac_ok():
+    """Pressure-gated drip + prefill admission is valid (forward-compat Stage)."""
+    cfg = GeoKVConfig.from_dict(
+        {
+            "experiment_mode": "geo_uniform",
+            "eviction_policy": "v_redundancy",
+            "decode_evict_blocks_per_step": 2,
+            "decode_evict_pressure_watermark": 0.9,
+            "prefill_evict_frac": 0.5,
+        }
+    )
+    assert cfg.decode_evict_pressure_watermark == 0.9
+    assert cfg.prefill_evict_frac == 0.5
+
+
+def test_scheduler_output_carries_free_fraction():
+    """The pressure signal rides SchedulerOutput: default is 0.0 (safe == full)
+    and a set value survives the pickle transport to the worker process."""
+    import pickle
+
+    from vllm.v1.core.sched.output import SchedulerOutput
+
+    empty = SchedulerOutput.make_empty()
+    assert empty.kv_cache_free_fraction == 0.0
+
+    so = SchedulerOutput.make_empty()
+    so.kv_cache_free_fraction = 0.37
+    roundtrip = pickle.loads(pickle.dumps(so, pickle.HIGHEST_PROTOCOL))
+    assert roundtrip.kv_cache_free_fraction == 0.37

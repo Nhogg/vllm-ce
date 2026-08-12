@@ -149,6 +149,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Mask-only block eviction (Option A, Milestone 1); created in
         # initialize_kv_cache() when an active_eviction mode is selected.
         self.geo_eviction_policy = None
+        self.geo_query_capturer = None
         self.geo_evicted_blocks: torch.Tensor | None = None
         self.geo_flex_builder_cls: type | None = None
 
@@ -600,6 +601,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.geo_evicted_blocks = torch.zeros(
             self.max_num_reqs, max_pages, dtype=torch.bool, device=self.device
         )
+        if self.geo_kv_config.query_relevance_enabled:
+            self._init_geo_query_capture()
         self.geo_eviction_policy = EvictionPolicy(
             self.geo_kv_config,
             kv_caches_dict,
@@ -608,6 +611,66 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             block_size,
             self.device,
             self.req_states.num_evicted_tokens_np,
+            self.geo_query_capturer,
+        )
+
+    def _init_geo_query_capture(self) -> None:
+        """Install sampled-layer post-RoPE query capture before model warmup."""
+        from vllm.v1.geo_kv.config import resolve_indices
+        from vllm.v1.geo_kv.query_capture import QueryCapturer
+        from vllm.v1.kv_cache_interface import AttentionSpec
+
+        layer_names: list[tuple[int, str]] = []
+        layer_idx = 0
+        for group in self.kv_cache_config.kv_cache_groups:
+            if not isinstance(group.kv_cache_spec, AttentionSpec):
+                continue
+            for name in group.layer_names:
+                layer_names.append((layer_idx, name))
+                layer_idx += 1
+        sampled = set(
+            resolve_indices(
+                self.geo_kv_config.score_sampled_layers,
+                layer_idx,
+                strict=True,
+            )
+        )
+        context = self.compilation_config.static_forward_context
+        specs: list[tuple[int, int, int, float]] = []
+        modules: list[tuple[int, Any]] = []
+        for idx, name in layer_names:
+            if idx not in sampled:
+                continue
+            attn = context.get(name)
+            if attn is None or not hasattr(attn, "_geo_query_capture"):
+                raise ValueError(
+                    f"[geo_kv] cannot capture queries for attention layer {name!r}"
+                )
+            specs.append(
+                (
+                    idx,
+                    int(attn.num_heads),
+                    int(attn.head_size),
+                    float(attn.impl.scale),
+                )
+            )
+            modules.append((idx, attn))
+        capturer = QueryCapturer(
+            specs,
+            max_num_reqs=self.max_num_reqs,
+            tail_tokens=self.geo_kv_config.query_tail_tokens,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        for idx, attn in modules:
+            attn._geo_query_capture = (
+                lambda query, layer_idx=idx: capturer.capture(layer_idx, query)
+            )
+        self.geo_query_capturer = capturer
+        logger.info(
+            "[geo_kv] query capture enabled: layers=%s tail_tokens=%d",
+            sorted(sampled),
+            self.geo_kv_config.query_tail_tokens,
         )
 
     def _stash_evicted_blocks(self, input_batch: InputBatch, dummy_run: bool) -> None:
@@ -870,6 +933,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         req_idx = self.req_states.remove_request(req_id)
         if req_idx is None:
             return False
+        if self.geo_eviction_policy is not None:
+            # Release lazy incremental scorer metadata as soon as a request
+            # finishes/preempts (not only when the slot is eventually reused).
+            # A resumed request is recomputed into a fresh physical row, so a
+            # full invalidation is the generation-safe behavior there too.
+            self.geo_eviction_policy.reset_request(req_idx)
         if self.pp_handler is not None:
             self.pp_handler.on_req_idx_freed(req_idx)
         if self.encoder_cache is not None:
@@ -880,8 +949,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return True
 
     def finish_requests(self, scheduler_output: SchedulerOutput) -> None:
-        finished_req_ids = scheduler_output.finished_req_ids
-        preempted_req_ids = scheduler_output.preempted_req_ids
+        finished_req_ids = scheduler_output.finished_req_ids or set()
+        preempted_req_ids = scheduler_output.preempted_req_ids or set()
+        if self.geo_query_capturer is not None:
+            for req_id in preempted_req_ids:
+                req_idx = self.req_states.req_id_to_index.get(req_id)
+                if req_idx is not None:
+                    self.geo_query_capturer.stash_request(req_id, req_idx)
+            for req_id in finished_req_ids:
+                self.geo_query_capturer.drop_request(req_id)
         if preempted_req_ids:
             finished_req_ids = finished_req_ids.union(preempted_req_ids)
         for req_id in finished_req_ids:
@@ -909,6 +985,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Streaming input update: request already exists from a prior
             # chunk. Remove old state so it can be cleanly re-added below
             # with the updated prompt_token_ids and mm_features.
+            old_req_index = self.req_states.req_id_to_index.get(req_id)
+            if self.geo_query_capturer is not None and old_req_index is not None:
+                self.geo_query_capturer.stash_request(req_id, old_req_index)
             self._remove_request(req_id)
 
             prompt_len = len(new_req_data.prompt_token_ids)
@@ -929,6 +1008,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 if self.geo_eviction_policy is not None:
                     # Clear the decoupled per-end decode band too (recycled slot).
                     self.geo_eviction_policy.reset_request(req_index)
+                if self.geo_query_capturer is not None:
+                    self.geo_query_capturer.restore_request(req_id, req_index)
 
             if self.encoder_cache is not None:
                 self.encoder_cache.add_request(req_id, new_req_data.mm_features)
@@ -992,6 +1073,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     f"{actual} blocks but storage_len={storage_len} needs "
                     f"{expected} (bs={bs}). Snapshot/delta desync."
                 )
+                if self.geo_eviction_policy is not None:
+                    # Phase 6: this assertion-backed row replacement is the
+                    # authoritative compaction acknowledgement.  Only now may
+                    # incremental scorer metadata discard evicted logical rows
+                    # and advance its generation; this happens before this
+                    # step's new decode block is appended below.
+                    self.geo_eviction_policy.on_compaction_applied(
+                        req_index, len(packed_block_ids)
+                    )
                 # storage_seq_len = num_computed - num_evicted; RoPE positions
                 # stay at num_computed (uncompacted). Phase-2 kernels already
                 # subtract this offset (slot mapping, seq/pos lens, mask).
@@ -1411,6 +1501,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         kernel_meta.no_lora_flag_cpu[0] = False
                         kernel_meta.num_active_loras_cpu[0] = 1
 
+        if self.geo_query_capturer is not None:
+            self.geo_query_capturer.begin_step(
+                input_batch.idx_mapping_np[: input_batch.num_reqs],
+                input_batch.query_start_loc_np[: input_batch.num_reqs + 1],
+                input_batch.num_scheduled_tokens[: input_batch.num_reqs],
+                input_batch.num_computed_prefill_tokens_np[: input_batch.num_reqs],
+                input_batch.prefill_len_np[: input_batch.num_reqs],
+                input_batch.is_prefilling_np[: input_batch.num_reqs],
+                dummy=dummy_run,
+            )
+
         attn_metadata = None
         slot_mappings_by_layer = None
         if not (dummy_run and skip_attn_for_dummy_run):
@@ -1546,7 +1647,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # given step, so the two maps never share a req_id. A no-op (empty)
             # unless decode_evict_budget is configured / mask-only.
             geo_freed_decode = self.geo_eviction_policy.on_decode_step(
-                input_batch, self.block_tables
+                input_batch,
+                self.block_tables,
+                cache_free_fraction=scheduler_output.kv_cache_free_fraction,
             )
             if geo_freed_decode:
                 geo_freed = {**geo_freed, **geo_freed_decode}

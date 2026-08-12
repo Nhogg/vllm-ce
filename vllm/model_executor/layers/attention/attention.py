@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -405,6 +406,9 @@ class Attention(nn.Module, AttentionLayerBase):
                 compilation_config.static_forward_context,
             )
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
+        # Installed only by the opt-in GeoKV query-aware experiment before
+        # warmup/compilation. The default None branch has no tensor work.
+        self._geo_query_capture: Callable[[torch.Tensor], None] | None = None
 
         # use a placeholder kv cache tensor during init, which will be replaced
         # by bind_kv_cache
@@ -481,6 +485,8 @@ class Attention(nn.Module, AttentionLayerBase):
         # NOTE(woosuk): We do this outside the custom op to minimize the
         # CPU overheads from the non-CUDA-graph regions.
         query = query.view(-1, self.num_heads, self.head_size)
+        if self._geo_query_capture is not None:
+            self._geo_query_capture(query)
         output = output.view(-1, self.num_heads, self.head_size_v)
         if key is not None:
             key = key.view(-1, self.num_kv_heads, self.head_size)

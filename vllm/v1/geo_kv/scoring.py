@@ -282,6 +282,108 @@ def block_anchors(k_blocks: torch.Tensor, valid_lens: torch.Tensor) -> torch.Ten
     return (k * mask.view(B, S, 1, 1)).sum(dim=1) / denom  # (B, H, D)
 
 
+def block_prototypes(
+    v_blocks: torch.Tensor,
+    valid_lens: torch.Tensor,
+    mode: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Represent each block by one or more valid-token V prototypes.
+
+    Args:
+        v_blocks: Value vectors shaped ``(B, S, H, D)``.
+        valid_lens: Number of valid tokens in each block, shaped ``(B,)``.
+        mode: ``mean``, ``quarters``, or ``mean_top2_norm``.
+
+    Returns:
+        A pair ``(prototypes, valid)``. ``prototypes`` has shape
+        ``(B, P, H, D)`` and ``valid`` has shape ``(B, P)``. Invalid prototypes
+        occur only for empty quarters in a partial final block and are excluded
+        from the conservative redundancy reduction.
+    """
+    B, S, H, D = v_blocks.shape
+    device = v_blocks.device
+    v = v_blocks.to(torch.float32)
+    pos = torch.arange(S, device=device).view(1, S)
+    token_valid = pos < valid_lens.view(B, 1)
+    denom = valid_lens.clamp(min=1).to(torch.float32).view(B, 1, 1)
+    mean = (v * token_valid.view(B, S, 1, 1)).sum(dim=1) / denom
+
+    if mode == "mean":
+        return mean[:, None], (valid_lens > 0)[:, None]
+
+    if mode == "quarters":
+        # tensor_split covers non-divisible block sizes without dropping tokens.
+        groups = torch.tensor_split(torch.arange(S, device=device), 4)
+        protos: list[torch.Tensor] = []
+        proto_valid: list[torch.Tensor] = []
+        for idx in groups:
+            group_mask = token_valid[:, idx]
+            count = group_mask.sum(dim=1)
+            total = (
+                v[:, idx] * group_mask.view(B, idx.numel(), 1, 1)
+            ).sum(dim=1)
+            protos.append(
+                total / count.clamp(min=1).to(torch.float32).view(B, 1, 1)
+            )
+            proto_valid.append(count > 0)
+        return torch.stack(protos, dim=1), torch.stack(proto_valid, dim=1)
+
+    if mode == "mean_top2_norm":
+        # Score tokens jointly across KV heads, then retain the two strongest
+        # valid token vectors in addition to the mean. For a one-token partial
+        # block, the second gathered token is marked invalid and ignored.
+        token_norm = torch.linalg.vector_norm(v, dim=-1).mean(dim=2)
+        token_norm = token_norm.masked_fill(~token_valid, float("-inf"))
+        topk = min(2, S)
+        top_idx = torch.topk(token_norm, k=topk, dim=1).indices
+        gather_idx = top_idx.view(B, topk, 1, 1).expand(B, topk, H, D)
+        strongest = v.gather(1, gather_idx)
+        ranks = torch.arange(topk, device=device).view(1, topk)
+        strongest_valid = ranks < valid_lens.clamp(max=topk).view(B, 1)
+        return (
+            torch.cat((mean[:, None], strongest), dim=1),
+            torch.cat(((valid_lens > 0)[:, None], strongest_valid), dim=1),
+        )
+
+    raise ValueError(f"unknown block prototype mode: {mode!r}")
+
+
+def block_multi_prototype_redundancy(
+    prototypes: torch.Tensor,
+    prototype_valid: torch.Tensor,
+) -> torch.Tensor:
+    """Conservative whole-block redundancy from multiple V prototypes.
+
+    Each valid prototype finds its best cosine match in every *other* block.
+    The block score is the minimum of those coverage values, so a block is
+    highly droppable only when all of its retained within-block features are
+    represented elsewhere.
+
+    Args:
+        prototypes: ``(B, P, H, D)`` block prototypes.
+        prototype_valid: ``(B, P)`` validity mask.
+
+    Returns:
+        ``(B,)`` droppability; higher means every prototype is more redundant.
+    """
+    B, P, _, _ = prototypes.shape
+    if B < 2:
+        return torch.zeros(B, device=prototypes.device, dtype=torch.float32)
+    f = torch.nn.functional.normalize(
+        prototypes.reshape(B, P, -1).to(torch.float32), dim=-1
+    )
+    flat = f.reshape(B * P, -1)
+    sim = (flat @ flat.t()).reshape(B, P, B, P)
+    same_block = torch.eye(B, device=prototypes.device, dtype=torch.bool)
+    sim = sim.masked_fill(same_block[:, None, :, None], float("-inf"))
+    sim = sim.masked_fill(~prototype_valid[None, None, :, :], float("-inf"))
+    coverage = sim.amax(dim=(2, 3))
+    # Invalid source prototypes must not lower the conservative block minimum.
+    coverage = coverage.masked_fill(~prototype_valid, float("inf"))
+    score = coverage.amin(dim=1)
+    return torch.where(torch.isfinite(score), score, torch.zeros_like(score))
+
+
 def block_joint_redundancy(anchors: torch.Tensor) -> torch.Tensor:
     """Per-block joint (all-heads) max-cosine redundancy.
 
@@ -302,10 +404,98 @@ def block_joint_redundancy(anchors: torch.Tensor) -> torch.Tensor:
     return sim.max(dim=1).values
 
 
-def block_value_l2(v_blocks: torch.Tensor, valid_lens: torch.Tensor) -> torch.Tensor:
+def block_joint_similarity(anchors: torch.Tensor) -> torch.Tensor:
+    """Whole-block cosine matrix used by global budget-aware coverage.
+
+    Unlike :func:`block_joint_redundancy`, the diagonal remains the block's
+    self-similarity. A kept-set facility-location objective needs that diagonal
+    so selecting a block fully covers its own information.
+    """
+    block_count = anchors.shape[0]
+    normalized = torch.nn.functional.normalize(
+        anchors.reshape(block_count, -1), dim=-1
+    )
+    return normalized @ normalized.t()
+
+
+def block_joint_redundancy_greedy(
+    anchors: torch.Tensor,
+    protect: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Greedy (iterative) per-block redundancy score.
+
+    :func:`block_joint_redundancy` scores every block against *all* other blocks
+    at once, so both halves of a near-duplicate pair score maximally redundant
+    and a top-k budget cut drops *both* -- annihilating the information that was
+    duplicated (the whole point of keeping one copy). This greedy variant peels
+    one block at a time: it drops the currently-most-redundant block, then
+    recomputes each survivor's max cosine against the *surviving* set only, so
+    once one twin is dropped its partner is no longer redundant and is protected.
+
+    Rather than return a single peel step, it runs the peel to completion over
+    all evictable blocks and encodes the **eviction order as a descending score**
+    (first-peeled == highest), so the existing ``argsort(descending)`` budget
+    selector consumes it unchanged and reaches any budget by taking a prefix.
+    The peel order is prefix-consistent: the block chosen at step ``i`` depends
+    only on the survivors after steps ``1..i-1``, independent of the final count,
+    so one full peel serves every budget.
+
+    Args:
+        anchors: ``(B, H, D)`` block anchors (e.g. from :func:`block_anchors`).
+        protect: optional ``(B,)`` bool mask of blocks that must never be peeled
+            (sink / anchor / tail). Protected blocks stay in the comparison set
+            (survivors a duplicate can hide behind) but are never chosen, and
+            receive the lowest scores. ``None`` == nothing protected here (the
+            downstream selector still enforces sink/anchor keep-rules).
+
+    Returns:
+        ``(B,)`` per-block droppability; higher == peeled earlier == more
+        droppable. Protected blocks receive the smallest scores (kept last).
+    """
+    B = anchors.shape[0]
+    device = anchors.device
+    if B < 2:
+        return torch.zeros(B, device=device, dtype=torch.float32)
+    f = torch.nn.functional.normalize(anchors.reshape(B, -1).to(torch.float32), dim=-1)
+    sim = f @ f.t()  # (B, B) cosine
+    sim.fill_diagonal_(float("-inf"))
+    if protect is None:
+        protect_mask = torch.zeros(B, dtype=torch.bool, device=device)
+    else:
+        protect_mask = protect.to(device=device, dtype=torch.bool)
+
+    # alive[j] == block j is still a survivor a duplicate can hide behind.
+    alive = torch.ones(B, dtype=torch.bool, device=device)
+    # Rank of eviction: earlier-peeled blocks get a larger score. Protected /
+    # never-peeled blocks keep -inf and are shifted to the bottom afterward.
+    scores = torch.full((B,), float("-inf"), device=device, dtype=torch.float32)
+    num_evictable = int((~protect_mask).sum())
+    sim_work = sim.clone()
+    for step in range(num_evictable):
+        # Each survivor's max cosine against the currently-alive set.
+        red = sim_work.max(dim=1).values  # (B,)
+        red = red.masked_fill(~alive, float("-inf"))
+        red = red.masked_fill(protect_mask, float("-inf"))
+        idx = int(red.argmax())
+        if not torch.isfinite(red[idx]):
+            break  # nothing left to peel
+        # Descending score by peel order: first peeled scores highest.
+        scores[idx] = float(num_evictable - step)
+        alive[idx] = False
+        # Drop it from the comparison set so partners stop counting it.
+        sim_work[:, idx] = float("-inf")
+    return scores
+
+
+def block_value_l2(
+    v_blocks: torch.Tensor,
+    valid_lens: torch.Tensor,
+    reduction: str = "sum",
+) -> torch.Tensor:
     """Per-block value-L2-norm score (the Paged-Eviction ``value_l2`` signal).
 
-    Replicates ``KVCachePruner.get_block_score`` from the Paged-Eviction fork
+    With ``reduction="sum"``, replicates ``KVCachePruner.get_block_score`` from
+    the Paged-Eviction fork
     (``vllm/attention/kvcache_prunner.py``): score a block by the L2 norm of its
     value vectors, averaged over KV heads and summed over the block's tokens ---
     ``norm(V, p=2, dim=-1).mean(heads).sum(tokens)``. The fork ignores padding in
@@ -322,6 +512,12 @@ def block_value_l2(v_blocks: torch.Tensor, valid_lens: torch.Tensor) -> torch.Te
             ``(B, block_size, H, D)``.
         valid_lens: ``(B,)`` int tensor of valid token counts per block.
 
+        reduction: ``sum`` (pinned block-score reproduction), ``max_token``
+            (protect a block with any strong token after averaging heads), or
+            ``max_token_head`` (protect a block with any strong token/head
+            cell). The max variants are whole-block approximations to the
+            fork's active token/head-granular pruning path.
+
     Returns:
         ``(B,)`` per-block value-L2-norm (magnitude; NOT yet negated).
     """
@@ -330,8 +526,180 @@ def block_value_l2(v_blocks: torch.Tensor, valid_lens: torch.Tensor) -> torch.Te
     v = v_blocks.to(torch.float32)
     pos = torch.arange(S, device=device).view(1, S)
     mask = (pos < valid_lens.view(B, 1)).to(torch.float32)  # (B, S)
-    per_tok = torch.norm(v, p=2, dim=-1).mean(dim=2)  # (B, S): mean over heads
-    return (per_tok * mask).sum(dim=1)  # (B,): sum over valid tokens
+    per_tok_head = torch.norm(v, p=2, dim=-1)  # (B, S, H)
+    per_tok = per_tok_head.mean(dim=2)  # (B, S): mean over heads
+    if reduction == "sum":
+        return (per_tok * mask).sum(dim=1)
+    if reduction == "max_token":
+        return per_tok.masked_fill(~mask.bool(), float("-inf")).max(dim=1).values
+    if reduction == "max_token_head":
+        valid = mask.bool().unsqueeze(-1)
+        return per_tok_head.masked_fill(~valid, float("-inf")).amax(dim=(1, 2))
+    raise ValueError(f"unknown value-L2 block reduction: {reduction!r}")
+
+
+def block_query_attention_mass(
+    queries: torch.Tensor,
+    k_blocks: torch.Tensor,
+    valid_lens: torch.Tensor,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """Exact causal QK attention mass assigned to each whole KV block.
+
+    ``queries`` contains the final observed queries, bounded by the configured
+    tail size. The function performs grouped-query attention against the
+    request's visible K cache, applies the valid-token and causal masks, and
+    averages attention mass over query tokens and query heads. It intentionally
+    omits V: this is a relevance signal used to protect blocks that the current
+    question/decode query reads, not a replacement attention output.
+
+    Args:
+        queries: Post-RoPE queries shaped ``(W, Hq, D)``.
+        k_blocks: Post-RoPE keys shaped ``(B, S, Hkv, D)``.
+        valid_lens: Valid token count per block, shaped ``(B,)``.
+        scale: Attention logit scale. Defaults to ``D**-0.5``.
+
+    Returns:
+        ``(B,)`` non-negative mass summing to approximately one.
+    """
+    if queries.ndim != 3 or k_blocks.ndim != 4:
+        raise ValueError("queries must be (W,Hq,D) and k_blocks (B,S,Hkv,D)")
+    W, Hq, D = queries.shape
+    B, S, Hkv, key_dim = k_blocks.shape
+    if W < 1 or B < 1 or key_dim != D or Hq % Hkv != 0:
+        raise ValueError(
+            "query/key shapes require W,B >= 1, equal head dims, and Hq % Hkv == 0"
+        )
+
+    q = queries.to(torch.float32).reshape(W, Hkv, Hq // Hkv, D)
+    k = k_blocks.to(torch.float32)
+    logits = torch.einsum("whgd,bshd->whgbs", q, k)
+    logits.mul_(float(scale) if scale is not None else D**-0.5)
+
+    device = k_blocks.device
+    token_pos = torch.arange(S, device=device).view(1, S)
+    token_valid = token_pos < valid_lens.view(B, 1)
+    # The captured queries are the last W valid tokens of this request in the
+    # current storage order. The runner reconstructs this tail across scheduler
+    # chunks and request-slot reassignment; decode naturally supplies W=1.
+    # Keep this scalar on device. ``int(valid_lens.sum())`` would introduce one
+    # GPU-to-host synchronization per sampled layer in the production scorer.
+    total_valid = valid_lens.sum()
+    query_pos = total_valid - W + torch.arange(W, device=device)
+    key_pos = (
+        torch.arange(B, device=device).view(B, 1) * S + token_pos
+    )
+    causal_valid = token_valid.unsqueeze(0) & (
+        key_pos.unsqueeze(0) <= query_pos.view(W, 1, 1)
+    )
+    logits = logits.masked_fill(
+        ~causal_valid.view(W, 1, 1, B, S), float("-inf")
+    )
+    probs = torch.softmax(logits.flatten(-2), dim=-1).view(W, Hkv, Hq // Hkv, B, S)
+    mass = probs.sum(dim=(0, 1, 2, 4)) / float(W * Hq)
+    return mass.to(torch.float32)
+
+
+def refine_with_query_relevance(
+    scores: torch.Tensor,
+    relevance: torch.Tensor | None,
+    weight: float | None,
+    tiebreak_only: bool = False,
+) -> torch.Tensor:
+    """Lower droppability for query-relevant blocks.
+
+    A positive ``weight`` combines per-request z-scored signals, making the
+    coefficient independent of request length and native score scale. With no
+    weight, ``tiebreak_only`` applies a bounded perturbation that can reorder
+    equal redundancy scores but cannot cross the smallest nonzero score gap.
+    Disabled inputs return the original tensor object unchanged.
+    """
+    if relevance is None or (not weight and not tiebreak_only):
+        return scores
+    if relevance.shape != scores.shape:
+        raise ValueError("query relevance and block scores must have equal shape")
+    if weight:
+        return zscore(scores) - float(weight) * zscore(relevance)
+
+    rel = relevance.to(device=scores.device, dtype=torch.float32)
+    span = rel.max() - rel.min()
+    if not torch.isfinite(span) or span <= 0:
+        return scores
+    rel01 = (rel - rel.min()) / span
+    x = scores.to(torch.float32)
+    uniq = torch.unique(x).sort().values
+    if uniq.numel() > 1:
+        gaps = uniq[1:] - uniq[:-1]
+        min_gap = gaps[gaps > 0].min()
+        eps = min_gap / 4.0
+    else:
+        eps = torch.tensor(
+            torch.finfo(torch.float32).eps * max(1.0, float(x.abs().max())),
+            device=x.device,
+        )
+    return x - eps * rel01
+
+
+def zscore(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Per-request z-score standardization of a ``(B,)`` score vector.
+
+    Centers to mean 0 and scales to unit std across the request's blocks, so two
+    heterogeneous signals (e.g. cosine redundancy and value-L2 norm) can be
+    blended on a common, scale-free footing regardless of their native
+    magnitudes. A near-constant vector (std < ``eps``) returns all-zeros.
+
+    Args:
+        x: ``(B,)`` per-block scores.
+        eps: floor on the std to avoid amplifying a degenerate (constant) signal.
+
+    Returns:
+        ``(B,)`` standardized scores (mean ~0, std ~1), or zeros if degenerate.
+    """
+    x = x.to(torch.float32)
+    if x.numel() < 2:
+        return torch.zeros_like(x)
+    sd = x.std()
+    if not torch.isfinite(sd) or sd < eps:
+        return torch.zeros_like(x)
+    return (x - x.mean()) / sd
+
+
+def positional_cosh_weights(
+    num_blocks: int,
+    alpha: float,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Per-block sech (``1/cosh``) positional weights over ``num_blocks``.
+
+    Maps each block's position to ``x in [-1, 1]`` (first block -> -1, last ->
+    +1, middle -> 0) and returns ``w[b] = 1/cosh(alpha * x_b)``. ``sech`` peaks
+    at 1.0 in the middle (``x=0``) and decays symmetrically toward
+    ``1/cosh(alpha)`` at the ends, so multiplying a droppability score by ``w``
+    inflates the middle blocks (more droppable) and shields the ends (sink /
+    tail). Larger ``alpha`` == steeper end protection; ``alpha == 0`` returns
+    all-ones (inert).
+
+    A single block maps to ``x = 0`` (weight 1.0); callers apply this only when
+    there are >= 2 blocks to evict, so the degenerate case never re-weights.
+
+    Args:
+        num_blocks: Number of positions to weight (the request's block count).
+        alpha: Non-negative steepness of the sech bump. 0 == all-ones.
+        device: Device for the returned tensor.
+        dtype: Float dtype for the returned tensor.
+
+    Returns:
+        ``(num_blocks,)`` tensor of weights in ``(0, 1]``.
+    """
+    if num_blocks <= 0:
+        return torch.ones(0, device=device, dtype=dtype)
+    if alpha <= 0.0 or num_blocks == 1:
+        return torch.ones(num_blocks, device=device, dtype=dtype)
+    # Positions -> [-1, 1] with both endpoints included (linspace, not arange).
+    x = torch.linspace(-1.0, 1.0, num_blocks, device=device, dtype=torch.float32)
+    w = 1.0 / torch.cosh(alpha * x)
+    return w.to(dtype)
 
 
 def _apply_norm(units: torch.Tensor, mode: str, eps: float = 1e-6) -> torch.Tensor:
