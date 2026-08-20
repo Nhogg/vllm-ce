@@ -209,6 +209,58 @@ def _value_norm_protect_mask(
     return mask
 
 
+def _query_relevance_protect_mask(
+    num_blocks: int,
+    lo: int,
+    hi: int,
+    policy: str,
+    query_relevance: torch.Tensor | None,
+    quantile: float | None,
+) -> torch.Tensor | None:
+    """Build a high-query-relevance protection mask, or ``None`` if off.
+
+    The threshold is computed only over the current evictable window, after
+    sink, anchor, and optional tail protection have narrowed it. The selector
+    uses the same relevance values to deterministically relax the least-relevant
+    protected blocks when necessary to preserve an exact budget.
+
+    Args:
+        num_blocks: Current logical block count (mask length).
+        lo: Start of the evictable window.
+        hi: End of the evictable window (exclusive).
+        policy: Eviction policy; only ``v_redundancy`` is supported.
+        query_relevance: ``(num_blocks,)`` aggregated causal QK attention mass.
+        quantile: Protection quantile in ``[0, 1)``, or ``None`` when disabled.
+
+    Returns:
+        ``(num_blocks,)`` CPU bool mask, or ``None`` when disabled.
+
+    Raises:
+        ValueError: If protection is enabled without matching relevance values.
+    """
+    if quantile is None:
+        return None
+    if policy != "v_redundancy":
+        raise ValueError(
+            "query relevance protection requires policy='v_redundancy'"
+        )
+    if query_relevance is None:
+        raise ValueError(
+            "query relevance protection requires per-block query relevance"
+        )
+    if query_relevance.shape != (num_blocks,):
+        raise ValueError("query relevance must match num_blocks")
+    if hi - lo <= 0:
+        return None
+    win = query_relevance[lo:hi].to(dtype=torch.float32)
+    if win.numel() == 0:
+        return None
+    threshold = torch.quantile(win, float(quantile))
+    mask = torch.zeros(num_blocks, dtype=torch.bool)
+    mask[lo:hi] = (win >= threshold).to(device="cpu")
+    return mask
+
+
 def select_evicted_blocks(
     scores: torch.Tensor,
     num_blocks: int,
@@ -266,6 +318,8 @@ def select_evicted_to_budget(
     tail_protect_frac: float | None = None,
     value_norm: torch.Tensor | None = None,
     value_norm_protect_quantile: float | None = None,
+    query_relevance: torch.Tensor | None = None,
+    query_relevance_protect_quantile: float | None = None,
 ) -> torch.Tensor:
     """Evict interior blocks down to a per-request budget under ``policy``.
 
@@ -304,6 +358,10 @@ def select_evicted_to_budget(
             remain, the lowest-norm protections are relaxed until ``k`` are
             available. Applies only to the scored ``v_redundancy`` path; sink /
             anchor / tail protection always take priority. None == off.
+        query_relevance: Optional ``(num_blocks,)`` causal query-attention mass.
+        query_relevance_protect_quantile: Protect blocks at or above this
+            per-request relevance quantile. If necessary, relax protection in
+            ascending relevance order to keep the exact budget. None == off.
 
     Returns:
         ``(num_blocks,)`` bool tensor; True = evict (hide from attention).
@@ -334,6 +392,23 @@ def select_evicted_to_budget(
     protect_mask = _value_norm_protect_mask(
         num_blocks, lo, hi, policy, value_norm, value_norm_protect_quantile
     )
+    query_protect_mask = _query_relevance_protect_mask(
+        num_blocks,
+        lo,
+        hi,
+        policy,
+        query_relevance,
+        query_relevance_protect_quantile,
+    )
+    if protect_mask is not None and query_protect_mask is not None:
+        raise ValueError(
+            "value-norm and query-relevance hard protections cannot be combined"
+        )
+    if query_protect_mask is not None:
+        protect_mask = query_protect_mask
+        protect_order = query_relevance
+    else:
+        protect_order = value_norm if protect_mask is not None else None
     evictable_t = torch.tensor(evictable, dtype=torch.long)
     chosen = _choose_evicted(
         evictable_t,
@@ -344,7 +419,7 @@ def select_evicted_to_budget(
         policy,
         seed,
         protect_mask=protect_mask,
-        protect_order=value_norm if protect_mask is not None else None,
+        protect_order=protect_order,
     )
     evict[chosen] = True
     return evict
@@ -565,6 +640,10 @@ class EvictionPolicy:
         # Per-fire global similarity matrix for the corrected facility-location
         # selector. Populated only by redundancy_mode="coverage".
         self._coverage_similarity: torch.Tensor | None = None
+        # Raw causal QK attention mass for hard relevance protection. It remains
+        # separate from finalized scores so positional cosh can compose without
+        # changing which high-relevance blocks the hard constraint protects.
+        self._query_relevance: torch.Tensor | None = None
         self._num_requests_evicted = 0
         # Decode-time eviction counters/throttle (mask-only).
         self._decode_step = 0
@@ -748,6 +827,7 @@ class EvictionPolicy:
         """
         cfg = self.config
         self._coverage_similarity = None
+        self._query_relevance = None
         value_l2 = cfg.eviction_policy == "value_l2"
         greedy = (not value_l2) and cfg.redundancy_mode == "greedy"
         coverage_mode = (not value_l2) and cfg.redundancy_mode == "coverage"
@@ -953,6 +1033,15 @@ class EvictionPolicy:
                     cfg.block_score_aggregation,
                     cfg.topk_frac,
                 )
+        if (
+            cfg.query_relevance_protect_quantile is not None
+            and query_relevance is None
+        ):
+            raise RuntimeError(
+                "query relevance protection is enabled but no query relevance "
+                "was captured"
+            )
+        self._query_relevance = query_relevance
         prof.record_fire(block_count, num_scored_layers)
         if query_window_len is not None:
             prof.record_query_window(query_window_len)
@@ -1102,6 +1191,10 @@ class EvictionPolicy:
             cfg.query_tail_protect_frac,
             value_norm=value_norm,
             value_norm_protect_quantile=cfg.value_norm_protect_quantile,
+            query_relevance=self._query_relevance,
+            query_relevance_protect_quantile=(
+                cfg.query_relevance_protect_quantile
+            ),
         )
 
     def _select_rate_mask(

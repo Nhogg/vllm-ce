@@ -80,8 +80,79 @@ DATASET2PROMPT = {
         'question, answer "yes", "no", or "unanswerable". Do not provide any '
         "explanation.\n\nQuestion: {input}\n\nAnswer:"
     ),
+    # Multi-hop QA over passages -- same template as hotpotqa (LongBench canon).
+    "2wikimqa": (
+        "Answer the question based on the given passages. Only give me the "
+        "answer and do not output any other words.\n\nThe following are given "
+        "passages.\n{context}\n\nAnswer the question based on the given "
+        "passages. Only give me the answer and do not output any other words."
+        "\n\nQuestion: {input}\nAnswer:"
+    ),
+    "musique": (
+        "Answer the question based on the given passages. Only give me the "
+        "answer and do not output any other words.\n\nThe following are given "
+        "passages.\n{context}\n\nAnswer the question based on the given "
+        "passages. Only give me the answer and do not output any other words."
+        "\n\nQuestion: {input}\nAnswer:"
+    ),
+    "narrativeqa": (
+        "You are given a story, which can be either a novel or a movie script, "
+        "and a question. Answer the question as concisely as you can, using a "
+        "single phrase if possible. Do not provide any explanation.\n\nStory: "
+        "{context}\n\nNow, answer the question based on the story as concisely "
+        "as you can, using a single phrase if possible. Do not provide any "
+        "explanation.\n\nQuestion: {input}\n\nAnswer:"
+    ),
+    # Synthetic exact-retrieval needle probe: answer is "Paragraph N".
+    "passage_retrieval_en": (
+        "Here are 30 paragraphs from Wikipedia, along with an abstract. Please "
+        "determine which paragraph the abstract is from.\n\n{context}\n\nThe "
+        "following is an abstract.\n\n{input}\n\nPlease enter the number of the "
+        "paragraph that the abstract is from. The answer format must be like "
+        '"Paragraph 1", "Paragraph 2", etc.\n\nThe answer is: '
+    ),
+    # Context-only summarization (no question): {input} is unused. Scored by
+    # ROUGE-L, not qa_f1. Canonical THUDM/LongBench templates.
+    "gov_report": (
+        "You are given a report by a government agency. Write a one-page "
+        "summary of the report.\n\nReport:\n{context}\n\nNow, write a one-page "
+        "summary of the report.\n\nSummary:"
+    ),
+    "multi_news": (
+        "You are given several news passages. Write a one-page summary of all "
+        "news.\n\nNews:\n{context}\n\nNow, write a one-page summary of all the "
+        "news.\n\nSummary:"
+    ),
 }
-DATASET2MAXGEN = {"multifieldqa_en": 64, "hotpotqa": 32, "qasper": 128}
+DATASET2MAXGEN = {
+    "multifieldqa_en": 64,
+    "hotpotqa": 32,
+    "qasper": 128,
+    "2wikimqa": 32,
+    "musique": 32,
+    "narrativeqa": 128,
+    "passage_retrieval_en": 32,
+    "gov_report": 512,
+    "multi_news": 512,
+}
+
+# Which scorer each task uses. QA tasks -> token-F1; summarization -> ROUGE-L.
+# Tasks absent here default to qa_f1 (keeps older callers working).
+DATASET2METRIC = {
+    "multifieldqa_en": "qa_f1",
+    "hotpotqa": "qa_f1",
+    "qasper": "qa_f1",
+    "2wikimqa": "qa_f1",
+    "musique": "qa_f1",
+    "narrativeqa": "qa_f1",
+    "passage_retrieval_en": "qa_f1",
+    "gov_report": "rouge_l",
+    "multi_news": "rouge_l",
+}
+
+# Summarization tasks have an empty {input}; their templates key only on
+# {context}. Listed separately so table tests don't require an {input} slot.
+SUMMARIZATION_TASKS = ("gov_report", "multi_news")
 
 # Layer bands to score V-redundancy over. "mid" is the discriminative band found
 # in the read-only work; "l0" is an ablation expected to underperform (high mean
@@ -126,6 +197,54 @@ def qa_f1(prediction: str, ground_truth: str) -> float:
 def qa_f1_max(prediction: str, answers: list[str]) -> float:
     """Max token-F1 over the gold answer list (LongBench convention)."""
     return max((qa_f1(prediction, a) for a in answers), default=0.0)
+
+
+# ROUGE-L scorer is constructed lazily and cached: the stemmer import is heavy
+# and QA-only runs must not pay for it.
+_ROUGE_SCORER = None
+
+
+def _get_rouge_scorer():
+    global _ROUGE_SCORER
+    if _ROUGE_SCORER is None:
+        from rouge_score import rouge_scorer
+
+        _ROUGE_SCORER = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
+    return _ROUGE_SCORER
+
+
+def rouge_l_max(prediction: str, answers: list[str]) -> float:
+    """Max ROUGE-L F-measure over the gold answer list (LongBench summ. tasks).
+
+    Mirrors THUDM/LongBench: summarization tasks (gov_report, multi_news) score
+    generated summaries by ROUGE-L rather than token-F1. Empty predictions score
+    0.0 (the scorer handles this without raising).
+    """
+    if not prediction.strip():
+        return 0.0
+    scorer = _get_rouge_scorer()
+    best = 0.0
+    for a in answers:
+        if not a:
+            continue
+        best = max(best, scorer.score(a, prediction)["rougeL"].fmeasure)
+    return best
+
+
+def score_prediction(task: str, prediction: str, answers: list[str]) -> float:
+    """Dispatch to the task's canonical metric (qa_f1 or rouge_l).
+
+    Args:
+        task: LongBench task name.
+        prediction: Model-generated text.
+        answers: Gold answer list.
+
+    Returns:
+        The task's metric in [0, 1]; qa_f1 for tasks not in DATASET2METRIC.
+    """
+    if DATASET2METRIC.get(task, "qa_f1") == "rouge_l":
+        return rouge_l_max(prediction, answers)
+    return qa_f1_max(prediction, answers)
 
 
 # ---------------------------------------------------------------------------

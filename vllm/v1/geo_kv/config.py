@@ -281,6 +281,13 @@ class GeoKVConfig:
     query_ema_beta: float | None = None
     query_alignment_weight: float | None = None
     enable_query_tiebreak: bool = False
+    # Protect blocks at or above this per-request query-relevance quantile, then
+    # rank the remaining blocks by the finalized redundancy score. If the hard
+    # guard leaves too few candidates for the exact budget, relax protected
+    # blocks in ascending relevance order. Unlike the linear query blend, this
+    # leaves the redundancy/cosh ranking unchanged among unprotected blocks.
+    # None is inert. Applies only to budget-based pairwise V-redundancy.
+    query_relevance_protect_quantile: float | None = None
     query_tail_tokens: int = 32
     # Tail-protect (recency floor) for the budget path: never V-evict the last
     # ``ceil(query_tail_protect_frac * num_blocks)`` blocks of a request. The
@@ -333,7 +340,11 @@ class GeoKVConfig:
 
     @property
     def query_relevance_enabled(self) -> bool:
-        return bool(self.query_alignment_weight) or self.enable_query_tiebreak
+        return (
+            bool(self.query_alignment_weight)
+            or self.enable_query_tiebreak
+            or self.query_relevance_protect_quantile is not None
+        )
 
     # -- construction -------------------------------------------------------
     @classmethod
@@ -512,6 +523,12 @@ class GeoKVConfig:
             )
         if self.query_alignment_weight is not None and self.query_alignment_weight < 0:
             raise ValueError("geo_kv.query_alignment_weight must be >= 0")
+        if self.query_relevance_protect_quantile is not None and not (
+            0.0 <= self.query_relevance_protect_quantile < 1.0
+        ):
+            raise ValueError(
+                "geo_kv.query_relevance_protect_quantile must be in [0, 1)"
+            )
         if self.query_tail_tokens < 1:
             raise ValueError("geo_kv.query_tail_tokens must be >= 1")
         if self.query_relevance_enabled:
@@ -530,6 +547,38 @@ class GeoKVConfig:
                     "geo_kv query relevance is incompatible with "
                     "calibrate_layer_subsets; calibrate the base layer subset "
                     "first, then evaluate query relevance on that fixed subset"
+                )
+        if self.query_relevance_protect_quantile is not None:
+            budget_selection_active = (
+                self.prefill_evict_frac is not None
+                or self.decode_evict_frac is not None
+                or self.decode_evict_budget is not None
+                or self.decode_evict_blocks_per_step is not None
+            )
+            if not budget_selection_active:
+                raise ValueError(
+                    "geo_kv.query_relevance_protect_quantile requires a "
+                    "budget-based eviction mechanism"
+                )
+            if self.redundancy_mode != "pairwise":
+                raise ValueError(
+                    "geo_kv.query_relevance_protect_quantile requires "
+                    "redundancy_mode='pairwise'"
+                )
+            decode_active = (
+                self.decode_evict_frac is not None
+                or self.decode_evict_budget is not None
+                or self.decode_evict_blocks_per_step is not None
+            )
+            if decode_active and not self.physical_reclaim:
+                raise ValueError(
+                    "geo_kv.query_relevance_protect_quantile requires "
+                    "physical_reclaim when decode eviction is active"
+                )
+            if self.value_norm_protect_quantile is not None:
+                raise ValueError(
+                    "geo_kv query-relevance and value-norm hard protections "
+                    "cannot be combined"
                 )
         if self.positional_cosh_alpha is not None and self.positional_cosh_alpha < 0.0:
             raise ValueError(
