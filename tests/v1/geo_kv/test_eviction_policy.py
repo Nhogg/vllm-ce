@@ -104,6 +104,116 @@ def test_query_relevance_config_is_opt_in_and_validated():
         )
 
 
+def test_query_relevance_hard_protection_config_is_inert_and_composes_with_cosh():
+    assert GeoKVConfig().query_relevance_protect_quantile is None
+    cfg = GeoKVConfig.from_dict(
+        {
+            "experiment_mode": "geo_uniform",
+            "physical_reclaim": True,
+            "decode_evict_budget": 64,
+            "query_relevance_protect_quantile": 0.9,
+            "positional_cosh_alpha": 1.5,
+        }
+    )
+    assert cfg.query_relevance_enabled
+    assert cfg.query_relevance_protect_quantile == 0.9
+    assert cfg.positional_cosh_alpha == 1.5
+
+    for bad in (-0.1, 1.0):
+        with pytest.raises(ValueError, match="query_relevance_protect_quantile"):
+            GeoKVConfig.from_dict(
+                {
+                    "experiment_mode": "geo_uniform",
+                    "physical_reclaim": True,
+                    "decode_evict_budget": 64,
+                    "query_relevance_protect_quantile": bad,
+                }
+            )
+
+
+def test_query_relevance_hard_protection_rejects_incompatible_paths():
+    common = {
+        "experiment_mode": "geo_uniform",
+        "physical_reclaim": True,
+        "decode_evict_budget": 64,
+        "query_relevance_protect_quantile": 0.9,
+    }
+    with pytest.raises(ValueError, match="eviction_policy='v_redundancy'"):
+        GeoKVConfig.from_dict({**common, "eviction_policy": "value_l2"})
+    with pytest.raises(ValueError, match="redundancy_mode='pairwise'"):
+        GeoKVConfig.from_dict({**common, "redundancy_mode": "coverage"})
+    with pytest.raises(ValueError, match="incremental_decode_scoring"):
+        GeoKVConfig.from_dict({**common, "incremental_decode_scoring": True})
+    with pytest.raises(ValueError, match="budget-based eviction"):
+        GeoKVConfig.from_dict(
+            {
+                "experiment_mode": "geo_uniform",
+                "query_relevance_protect_quantile": 0.9,
+            }
+        )
+
+
+def test_query_relevance_hard_protection_shields_high_relevance_blocks():
+    scores = torch.tensor([0.99, 0.9, 0.8, 0.7, 0.6, 0.0])
+    relevance = torch.tensor([0.99, 0.9, 0.1, 0.2, 0.3, 1.0])
+    mask = select_evicted_to_budget(
+        scores,
+        num_blocks=6,
+        budget=4,
+        query_relevance=relevance,
+        query_relevance_protect_quantile=0.6,
+        warmup_pages=0,
+    )
+    assert torch.nonzero(mask).flatten().tolist() == [2, 3]
+
+
+def test_query_relevance_hard_protection_relaxes_lowest_relevance_exactly():
+    scores = torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.0])
+    relevance = torch.tensor([5.0, 4.0, 3.0, 2.0, 1.0, 9.0])
+    mask = select_evicted_to_budget(
+        scores,
+        num_blocks=6,
+        budget=2,
+        query_relevance=relevance,
+        query_relevance_protect_quantile=0.0,
+        warmup_pages=0,
+    )
+    assert torch.nonzero(mask).flatten().tolist() == [1, 2, 3, 4]
+    assert not bool(mask[0])
+    assert not bool(mask[5])
+
+
+def test_query_relevance_hard_protection_relaxation_ties_use_block_order():
+    scores = torch.ones(6)
+    relevance = torch.tensor([9.0, 1.0, 1.0, 2.0, 3.0, 10.0])
+    mask = select_evicted_to_budget(
+        scores,
+        num_blocks=6,
+        budget=4,
+        query_relevance=relevance,
+        query_relevance_protect_quantile=0.0,
+        warmup_pages=0,
+    )
+    assert torch.nonzero(mask).flatten().tolist() == [1, 2]
+
+
+def test_query_relevance_hard_protection_none_is_exactly_inert():
+    scores = torch.tensor([0.1, 0.9, 0.2, 0.8, 0.3, 0.0])
+    relevance = torch.tensor([0.9, 0.8, 0.7, 0.6, 0.5, 1.0])
+    base = select_evicted_to_budget(
+        scores, num_blocks=6, budget=3, warmup_pages=0
+    )
+    disabled = select_evicted_to_budget(
+        scores,
+        num_blocks=6,
+        budget=3,
+        warmup_pages=0,
+        query_relevance=relevance,
+        query_relevance_protect_quantile=None,
+    )
+    torch.testing.assert_close(base, disabled, rtol=0, atol=0)
+
+
 def test_select_rate_one_keeps_sink_and_last():
     n, warmup = 10, 2
     mask = select_evicted_blocks(torch.zeros(n), n, 1.0, "recency", warmup, 0)
