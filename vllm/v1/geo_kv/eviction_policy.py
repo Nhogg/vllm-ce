@@ -425,6 +425,61 @@ def select_evicted_to_budget(
     return evict
 
 
+def select_evicted_r2r(
+    scores: torch.Tensor,
+    query_relevance: torch.Tensor,
+    num_blocks: int,
+    budget: int,
+    warmup_pages: int,
+    candidate_expansion_factor: float,
+    tail_protect_frac: float | None = None,
+) -> torch.Tensor:
+    """Evict least-relevant blocks from a redundancy-ranked shortlist.
+
+    Stage 1 selects up to ``round(factor * k)`` of the most value-redundant
+    blocks, where ``k`` is the exact number required by the budget. Stage 2
+    evicts the ``k`` least query-relevant candidates. Sink, final-anchor, and
+    clamped tail protections match :func:`select_evicted_to_budget`.
+    """
+    if scores.shape != (num_blocks,) or query_relevance.shape != (num_blocks,):
+        raise ValueError("R2R scores and query relevance must match num_blocks")
+    if candidate_expansion_factor < 1.0:
+        raise ValueError("R2R candidate expansion factor must be >= 1")
+    evict = torch.zeros(num_blocks, dtype=torch.bool)
+    if num_blocks <= budget:
+        return evict
+    lo = max(int(warmup_pages), 0)
+    hi = num_blocks - 1
+    k = min(num_blocks - budget, max(hi - lo, 0))
+    if k <= 0:
+        return evict
+    if tail_protect_frac:
+        tail = math.ceil(tail_protect_frac * num_blocks)
+        tail = max(0, min(tail, (hi - lo) - k))
+        hi -= tail
+    window_size = hi - lo
+    if window_size <= 0:
+        return evict
+    k = min(k, window_size)
+    candidate_count = min(
+        max(int(round(candidate_expansion_factor * k)), k),
+        window_size,
+    )
+
+    redundancy = scores.detach()[lo:hi].to(torch.float32)
+    candidate_order = torch.argsort(redundancy, descending=True, stable=True)
+    candidates = candidate_order[:candidate_count] + lo
+    relevance = query_relevance.detach().to(
+        device=candidates.device, dtype=torch.float32
+    )
+    relevance_order = torch.argsort(
+        relevance[candidates], descending=False, stable=True
+    )
+    chosen = candidates[relevance_order[:k]].to(device="cpu")
+    evict[chosen] = True
+    return evict
+
+
 def select_evicted_by_coverage(
     similarity: torch.Tensor,
     num_blocks: int,
@@ -1184,6 +1239,19 @@ class EvictionPolicy:
     ) -> torch.Tensor:
         """Dispatch a budget cut to pairwise ranking or global coverage."""
         cfg = self.config
+        if cfg.candidate_expansion_factor is not None:
+            relevance = self._query_relevance
+            if relevance is None:
+                raise RuntimeError("R2R selection missing query relevance")
+            return select_evicted_r2r(
+                scores,
+                relevance,
+                count,
+                budget,
+                int(cfg.warmup_pages or 0),
+                cfg.candidate_expansion_factor,
+                cfg.query_tail_protect_frac,
+            )
         if cfg.redundancy_mode == "coverage":
             similarity = self._coverage_similarity
             if similarity is None:

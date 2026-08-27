@@ -18,6 +18,7 @@ from vllm.v1.geo_kv.eviction_policy import (
     aggregate_layer_scores,
     select_evicted_blocks,
     select_evicted_by_coverage,
+    select_evicted_r2r,
     select_evicted_to_budget,
 )
 from vllm.v1.geo_kv.scoring import (
@@ -79,6 +80,107 @@ def test_query_relevance_refinement_is_inert_weighted_and_tie_only():
     assert tied[1] < tied[2]
     # The perturbation does not cross either neighboring non-tied score.
     assert tied[0] < tied[1] < tied[3]
+
+
+def test_r2r_selects_least_relevant_from_redundancy_shortlist():
+    scores = torch.tensor([0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.0])
+    relevance = torch.tensor([0.9, 0.8, 0.1, 0.2, 0.0, 0.3, 0.4, 1.0])
+
+    mask = select_evicted_r2r(
+        scores,
+        relevance,
+        num_blocks=8,
+        budget=6,
+        warmup_pages=0,
+        candidate_expansion_factor=2.0,
+    )
+
+    assert torch.nonzero(mask).flatten().tolist() == [2, 3]
+
+
+def test_r2r_factor_one_matches_pure_redundancy():
+    scores = torch.tensor([0.2, 0.9, 0.4, 0.8, 0.1, 0.7, 0.3, 0.0])
+    relevance = torch.tensor([0.0, 0.9, 0.1, 0.8, 0.2, 0.7, 0.3, 1.0])
+    expected = select_evicted_to_budget(
+        scores, num_blocks=8, budget=5, warmup_pages=1
+    )
+
+    actual = select_evicted_r2r(
+        scores,
+        relevance,
+        num_blocks=8,
+        budget=5,
+        warmup_pages=1,
+        candidate_expansion_factor=1.0,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_r2r_large_factor_becomes_pure_relevance_and_keeps_protections():
+    scores = torch.arange(10, dtype=torch.float32)
+    relevance = torch.tensor([0.0, 0.1, 0.9, 0.8, 0.7, 0.6, 0.2, 0.3, 0.4, 0.0])
+
+    mask = select_evicted_r2r(
+        scores,
+        relevance,
+        num_blocks=10,
+        budget=7,
+        warmup_pages=1,
+        candidate_expansion_factor=100.0,
+        tail_protect_frac=0.2,
+    )
+
+    assert torch.nonzero(mask).flatten().tolist() == [1, 5, 6]
+    assert int(mask.sum()) == 3
+    assert not bool(mask[0])
+    assert not bool(mask[8:].any())
+
+
+def test_r2r_config_enables_query_capture_and_validates_combinations():
+    cfg = GeoKVConfig.from_dict(
+        {
+            "experiment_mode": "geo_uniform",
+            "prefill_evict_frac": 0.5,
+            "candidate_expansion_factor": 2.0,
+        }
+    )
+    assert cfg.query_relevance_enabled
+    assert cfg.candidate_expansion_factor == 2.0
+
+    for factor in (0.5, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="candidate_expansion_factor"):
+            GeoKVConfig.from_dict(
+                {
+                    "experiment_mode": "geo_uniform",
+                    "prefill_evict_frac": 0.5,
+                    "candidate_expansion_factor": factor,
+                }
+            )
+    with pytest.raises(ValueError, match="budget-based eviction"):
+        GeoKVConfig.from_dict(
+            {
+                "experiment_mode": "geo_uniform",
+                "candidate_expansion_factor": 2.0,
+            }
+        )
+    with pytest.raises(ValueError, match="score refinements"):
+        GeoKVConfig.from_dict(
+            {
+                "experiment_mode": "geo_uniform",
+                "prefill_evict_frac": 0.5,
+                "candidate_expansion_factor": 2.0,
+                "query_alignment_weight": 0.5,
+            }
+        )
+    with pytest.raises(ValueError, match="physical_reclaim"):
+        GeoKVConfig.from_dict(
+            {
+                "experiment_mode": "geo_uniform",
+                "decode_evict_budget": 64,
+                "candidate_expansion_factor": 2.0,
+            }
+        )
 
 
 def test_query_relevance_config_is_opt_in_and_validated():

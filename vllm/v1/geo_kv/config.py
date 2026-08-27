@@ -14,6 +14,7 @@ physical eviction unit is always a whole vLLM block. See ``plan.md``.
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, fields
 from typing import TYPE_CHECKING, Any
 
@@ -288,6 +289,11 @@ class GeoKVConfig:
     # leaves the redundancy/cosh ranking unchanged among unprotected blocks.
     # None is inert. Applies only to budget-based pairwise V-redundancy.
     query_relevance_protect_quantile: float | None = None
+    # R2R Stage 1 candidate expansion factor. When set, shortlist
+    # ``round(factor * blocks_to_evict)`` blocks by pairwise value redundancy,
+    # then evict the least query-relevant blocks from that shortlist. ``1`` is
+    # exactly the pinned pure-redundancy selector. None disables R2R.
+    candidate_expansion_factor: float | None = None
     query_tail_tokens: int = 32
     # Tail-protect (recency floor) for the budget path: never V-evict the last
     # ``ceil(query_tail_protect_frac * num_blocks)`` blocks of a request. The
@@ -344,6 +350,7 @@ class GeoKVConfig:
             bool(self.query_alignment_weight)
             or self.enable_query_tiebreak
             or self.query_relevance_protect_quantile is not None
+            or self.candidate_expansion_factor is not None
         )
 
     # -- construction -------------------------------------------------------
@@ -547,6 +554,54 @@ class GeoKVConfig:
                     "geo_kv query relevance is incompatible with "
                     "calibrate_layer_subsets; calibrate the base layer subset "
                     "first, then evaluate query relevance on that fixed subset"
+                )
+        if self.candidate_expansion_factor is not None:
+            if not math.isfinite(self.candidate_expansion_factor) or (
+                self.candidate_expansion_factor < 1.0
+            ):
+                raise ValueError(
+                    "geo_kv.candidate_expansion_factor must be >= 1"
+                )
+            budget_selection_active = (
+                self.prefill_evict_frac is not None
+                or self.decode_evict_frac is not None
+                or self.decode_evict_budget is not None
+                or self.decode_evict_blocks_per_step is not None
+            )
+            if not budget_selection_active:
+                raise ValueError(
+                    "geo_kv.candidate_expansion_factor requires a "
+                    "budget-based eviction mechanism"
+                )
+            if (
+                self.redundancy_mode != "pairwise"
+                or self.block_prototype_mode != "mean"
+            ):
+                raise ValueError(
+                    "geo_kv.candidate_expansion_factor requires pairwise "
+                    "mean-prototype redundancy"
+                )
+            if (
+                self.query_alignment_weight is not None
+                or self.enable_query_tiebreak
+                or self.query_relevance_protect_quantile is not None
+                or self.value_norm_protect_quantile is not None
+                or self.value_blend_beta is not None
+                or bool(self.positional_cosh_alpha)
+            ):
+                raise ValueError(
+                    "geo_kv.candidate_expansion_factor is incompatible with "
+                    "value/query score refinements and positional weighting"
+                )
+            decode_active = (
+                self.decode_evict_frac is not None
+                or self.decode_evict_budget is not None
+                or self.decode_evict_blocks_per_step is not None
+            )
+            if decode_active and not self.physical_reclaim:
+                raise ValueError(
+                    "geo_kv.candidate_expansion_factor requires "
+                    "physical_reclaim when decode eviction is active"
                 )
         if self.query_relevance_protect_quantile is not None:
             budget_selection_active = (
