@@ -433,12 +433,15 @@ def select_evicted_r2r(
     warmup_pages: int,
     candidate_expansion_factor: float,
     tail_protect_frac: float | None = None,
+    similarity: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Evict least-relevant blocks from a redundancy-ranked shortlist.
 
     Stage 1 selects up to ``round(factor * k)`` of the most value-redundant
     blocks, where ``k`` is the exact number required by the budget. Stage 2
-    evicts the ``k`` least query-relevant candidates. Sink, final-anchor, and
+    evicts the ``k`` least query-relevant candidates. When ``similarity`` is
+    provided, a best-cover guard avoids evicting both sides of a duplicate pair
+    when another candidate can satisfy the budget. Sink, final-anchor, and
     clamped tail protections match :func:`select_evicted_to_budget`.
     """
     if scores.shape != (num_blocks,) or query_relevance.shape != (num_blocks,):
@@ -475,7 +478,33 @@ def select_evicted_r2r(
     relevance_order = torch.argsort(
         relevance[candidates], descending=False, stable=True
     )
-    chosen = candidates[relevance_order[:k]].to(device="cpu")
+    ranked_candidates = candidates[relevance_order]
+    if similarity is None:
+        chosen = ranked_candidates[:k].to(device="cpu")
+    else:
+        if similarity.shape != (num_blocks, num_blocks):
+            raise ValueError("R2R similarity must be square and match num_blocks")
+        sim = similarity.detach().to(
+            device=ranked_candidates.device, dtype=torch.float32
+        ).clone()
+        sim.fill_diagonal_(float("-inf"))
+        best_cover = sim.argmax(dim=1)
+        alive = torch.ones(num_blocks, dtype=torch.bool, device=sim.device)
+        guarded: list[int] = []
+        skipped: list[int] = []
+        for candidate in ranked_candidates.tolist():
+            if bool(alive[best_cover[candidate]]):
+                guarded.append(candidate)
+                alive[candidate] = False
+                if len(guarded) == k:
+                    break
+            else:
+                skipped.append(candidate)
+        # Exact memory matching takes priority when the shortlist cannot supply
+        # k cover-safe choices (for example n=1 with both twins shortlisted).
+        if len(guarded) < k:
+            guarded.extend(skipped[: k - len(guarded)])
+        chosen = torch.tensor(guarded, dtype=torch.long, device="cpu")
     evict[chosen] = True
     return evict
 
@@ -886,6 +915,7 @@ class EvictionPolicy:
         value_l2 = cfg.eviction_policy == "value_l2"
         greedy = (not value_l2) and cfg.redundancy_mode == "greedy"
         coverage_mode = (not value_l2) and cfg.redundancy_mode == "coverage"
+        r2r_mode = (not value_l2) and cfg.candidate_expansion_factor is not None
         blend_beta = None if value_l2 else cfg.value_blend_beta
         # Phase 2 norm protection also needs the per-block value-L2 norm; compute
         # it whenever either consumer is active (both only apply to v_redundancy).
@@ -1014,7 +1044,7 @@ class EvictionPolicy:
                         )
                     )
             with prof.section("similarity"):
-                if coverage_mode:
+                if coverage_mode or r2r_mode:
                     assert anchors is not None
                     similarity = block_joint_similarity(anchors)
                     per_layer_similarity.append(similarity)
@@ -1251,6 +1281,7 @@ class EvictionPolicy:
                 int(cfg.warmup_pages or 0),
                 cfg.candidate_expansion_factor,
                 cfg.query_tail_protect_frac,
+                self._coverage_similarity,
             )
         if cfg.redundancy_mode == "coverage":
             similarity = self._coverage_similarity

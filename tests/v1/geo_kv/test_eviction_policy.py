@@ -137,6 +137,56 @@ def test_r2r_large_factor_becomes_pure_relevance_and_keeps_protections():
     assert not bool(mask[8:].any())
 
 
+def test_r2r_twin_guard_keeps_one_duplicate_and_backfills():
+    scores = torch.tensor([1.0, 1.0, 0.9, 0.8, 0.1, 0.0])
+    relevance = torch.tensor([0.0, 0.1, 0.2, 0.3, 0.9, 1.0])
+    similarity = torch.eye(6)
+    similarity[0, 1] = similarity[1, 0] = 0.99
+    similarity[2, 3] = similarity[3, 2] = 0.5
+
+    unguarded = select_evicted_r2r(
+        scores,
+        relevance,
+        num_blocks=6,
+        budget=4,
+        warmup_pages=0,
+        candidate_expansion_factor=2.0,
+    )
+    guarded = select_evicted_r2r(
+        scores,
+        relevance,
+        num_blocks=6,
+        budget=4,
+        warmup_pages=0,
+        candidate_expansion_factor=2.0,
+        similarity=similarity,
+    )
+
+    assert torch.nonzero(unguarded).flatten().tolist() == [0, 1]
+    assert torch.nonzero(guarded).flatten().tolist() == [0, 2]
+    assert int(guarded.sum()) == 2
+
+
+def test_r2r_twin_guard_falls_back_to_preserve_exact_budget():
+    scores = torch.tensor([1.0, 1.0, 0.2, 0.0])
+    relevance = torch.tensor([0.0, 0.1, 0.9, 1.0])
+    similarity = torch.eye(4)
+    similarity[0, 1] = similarity[1, 0] = 0.99
+
+    mask = select_evicted_r2r(
+        scores,
+        relevance,
+        num_blocks=4,
+        budget=2,
+        warmup_pages=0,
+        candidate_expansion_factor=1.0,
+        similarity=similarity,
+    )
+
+    assert torch.nonzero(mask).flatten().tolist() == [0, 1]
+    assert int(mask.sum()) == 2
+
+
 def test_r2r_config_enables_query_capture_and_validates_combinations():
     cfg = GeoKVConfig.from_dict(
         {
