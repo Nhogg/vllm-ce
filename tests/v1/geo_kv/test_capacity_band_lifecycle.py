@@ -927,6 +927,26 @@ def test_drip_physical_cadence_n_per_two_steps():
     assert policy._num_decode_evictions == 2
 
 
+def test_mask_only_drip_hides_new_blocks_on_each_fire():
+    """Mask-only drip accumulates N newly hidden blocks instead of stalling."""
+    n = 2
+    policy = _make_drip_policy(blocks_per_step=n, physical=False)
+    bt = _make_block_tables()
+    _place(bt, 0, P)
+    batch = _decode_batch(["r0"], [0], [P * BLOCK_SIZE])
+
+    assert policy.on_decode_step(batch, bt) == {}
+    first = policy.evicted_store[0, :P].clone()
+    assert int(first.sum()) == n
+    assert policy._num_decode_evictions == 1
+
+    assert policy.on_decode_step(batch, bt) == {}
+    second = policy.evicted_store[0, :P].clone()
+    assert torch.all(second[first])
+    assert int(second.sum()) == 2 * n
+    assert policy._num_decode_evictions == 2
+
+
 def test_drip_composes_with_prefill_frac():
     """Stage B path: strict admission (prefill_evict_frac) THEN a decode drip off
     the compacted row."""

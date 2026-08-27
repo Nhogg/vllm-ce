@@ -1493,8 +1493,18 @@ class EvictionPolicy:
         # value_l2), force its score to +inf so scoring re-selects it;
         # recency/random pick by index (oldest-k is a prefix, so previously-hidden
         # oldest blocks stay chosen). The OR-merge then guarantees the store only
-        # ever gains True and stays at the watermark for every policy.
+        # ever gains True for every policy.
         prev = self.evicted_store[req_index, :count].to("cpu")
+        if blocks_per_step is not None:
+            # The selector's budget describes the total number of kept blocks,
+            # while a mask-only drip promises N *new* hidden blocks per fire.
+            # Include the blocks hidden by prior fires in the total eviction
+            # target; otherwise +inf re-selection consumes the entire top-N and
+            # the drip stalls after its first fire.
+            budget = max(
+                count - int(blocks_per_step) - int(prev.sum().item()),
+                0,
+            )
         if bool(prev.any()):
             scores = scores.detach().to(device="cpu", dtype=torch.float32).clone()
             scores[prev] = float("inf")
