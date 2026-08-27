@@ -591,11 +591,28 @@ class GeoKVConfig:
             self.block_prototype_mode,
             BLOCK_PROTOTYPE_MODES,
         )
-        if self.redundancy_mode == "greedy" and self.block_prototype_mode != "mean":
-            raise ValueError(
-                "geo_kv.block_prototype_mode currently requires "
-                "redundancy_mode='pairwise' unless it is 'mean'"
-            )
+        if self.redundancy_mode == "greedy":
+            if self.eviction_policy != "v_redundancy":
+                raise ValueError(
+                    "geo_kv.redundancy_mode='greedy' requires "
+                    "eviction_policy='v_redundancy'"
+                )
+            if self.block_prototype_mode != "mean":
+                raise ValueError(
+                    "geo_kv.block_prototype_mode currently requires "
+                    "redundancy_mode='pairwise' unless it is 'mean'"
+                )
+            if (
+                self.value_blend_beta
+                or self.value_norm_protect_quantile is not None
+                or self.query_relevance_enabled
+                or self.calibrate_layer_subsets
+                or bool(self.positional_cosh_alpha)
+            ):
+                raise ValueError(
+                    "geo_kv.redundancy_mode='greedy' is incompatible with "
+                    "value/query refinements and layer calibration"
+                )
         if self.redundancy_mode == "coverage":
             decode_active = (
                 self.decode_evict_budget is not None

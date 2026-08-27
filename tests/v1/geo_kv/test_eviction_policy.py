@@ -1181,6 +1181,38 @@ def test_config_accepts_prototype_modes_and_rejects_greedy_combo():
         )
 
 
+def test_greedy_mode_accepts_unrefined_v_redundancy():
+    cfg = GeoKVConfig.from_dict(
+        {
+            "experiment_mode": "geo_uniform",
+            "redundancy_mode": "greedy",
+        }
+    )
+    assert cfg.redundancy_mode == "greedy"
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"eviction_policy": "recency"},
+        {"value_blend_beta": 0.5},
+        {"value_norm_protect_quantile": 0.9},
+        {"query_alignment_weight": 1.0},
+        {"enable_query_tiebreak": True},
+        {"positional_cosh_alpha": 1.0},
+        {"calibrate_layer_subsets": True},
+    ],
+)
+def test_greedy_mode_rejects_incompatible_paths(extra):
+    raw = {
+        "experiment_mode": "geo_uniform",
+        "redundancy_mode": "greedy",
+    }
+    raw.update(extra)
+    with pytest.raises(ValueError, match="greedy"):
+        GeoKVConfig.from_dict(raw)
+
+
 def test_config_accepts_and_rejects_value_norm_protect_quantile():
     for q in (0.0, 0.5, 0.95):
         cfg = GeoKVConfig.from_dict(
