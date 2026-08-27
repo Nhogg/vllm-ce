@@ -63,9 +63,9 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# Synthetic request-id prefixes used by kernel warmup / dummy runs; never real
-# serving requests, so never evicted. Kept in sync with prefill_scorer.py.
-_SYNTHETIC_REQ_PREFIXES = ("_warmup_", "req_")
+# Reserved request-id prefix used by kernel warmup; never a real serving request,
+# so never evicted. Dummy runs are excluded explicitly by the model runner.
+_KERNEL_WARMUP_REQ_PREFIX = "_warmup_"
 
 
 def _choose_evicted(
@@ -759,7 +759,7 @@ class EvictionPolicy:
         for i in range(input_batch.num_reqs):
             if not bool(input_batch.is_prefilling_np[i]):
                 continue
-            if input_batch.req_ids[i].startswith(_SYNTHETIC_REQ_PREFIXES):
+            if input_batch.req_ids[i].startswith(_KERNEL_WARMUP_REQ_PREFIX):
                 continue  # skip kernel-warmup / dummy requests
             computed = int(input_batch.num_computed_prefill_tokens_np[i])
             scheduled = int(input_batch.num_scheduled_tokens[i])
@@ -1379,7 +1379,7 @@ class EvictionPolicy:
         for i in range(input_batch.num_reqs):
             if bool(input_batch.is_prefilling_np[i]):
                 continue  # decode requests only
-            if input_batch.req_ids[i].startswith(_SYNTHETIC_REQ_PREFIXES):
+            if input_batch.req_ids[i].startswith(_KERNEL_WARMUP_REQ_PREFIX):
                 continue
             req_index = int(input_batch.idx_mapping_np[i])
             # Current total sequence length after this step's tokens (RoPE /

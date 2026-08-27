@@ -358,13 +358,39 @@ def test_prefill_skips_synthetic_requests():
     policy = _make_policy()
     bt = _make_block_tables()
     _place(bt, 0, CAP)
-    # "req_" and "_warmup_" are synthetic prefixes -> never evicted.
-    batch = _prefill_batch(["req_0"], [0], [CAP * BLOCK_SIZE], [True])
+    batch = _prefill_batch(["_warmup_0_"], [0], [CAP * BLOCK_SIZE], [True])
 
     freed = policy.on_step(batch, bt)
 
     assert freed == {}
     assert _store_true(policy, 0) == 0
+
+
+def test_prefill_allows_user_request_id_starting_with_req():
+    policy = _make_policy()
+    bt = _make_block_tables()
+    _place(bt, 0, CAP)
+    batch = _prefill_batch(["req_customer_0"], [0], [CAP * BLOCK_SIZE], [True])
+
+    freed = policy.on_step(batch, bt)
+
+    assert set(freed) == {"req_customer_0"}
+    assert _store_true(policy, 0) > 0
+
+
+def test_score_only_allows_user_request_id_starting_with_req():
+    from vllm.v1.geo_kv.prefill_scorer import PrefillScorer
+
+    batch = _prefill_batch(
+        ["req_customer_0", "_warmup_0_"],
+        [0, 1],
+        [CAP * BLOCK_SIZE, CAP * BLOCK_SIZE],
+        [True, True],
+    )
+
+    finished = PrefillScorer._finished_prefill_requests(object(), batch)
+
+    assert finished == [(0, 0, CAP * BLOCK_SIZE)]
 
 
 def test_prefill_only_finished_requests():
@@ -456,23 +482,23 @@ def test_decode_interval_throttle():
     assert policy._num_decode_evictions == 1
 
 
-def test_decode_skips_prefilling_and_synthetic():
+def test_decode_skips_prefilling_and_warmup_but_allows_req_prefix():
     policy = _make_policy()
     bt = _make_block_tables()
     _place(bt, 0, CAP)
     _place(bt, 1, CAP)
-    # r0 is still prefilling; req_1 is synthetic -> both skipped.
+    _place(bt, 2, CAP)
     batch = _decode_batch(
-        ["r0", "req_1"],
-        [0, 1],
-        [CAP * BLOCK_SIZE, CAP * BLOCK_SIZE],
-        prefilling=[True, False],
+        ["r0", "_warmup_1_", "req_customer_2"],
+        [0, 1, 2],
+        [CAP * BLOCK_SIZE, CAP * BLOCK_SIZE, CAP * BLOCK_SIZE],
+        prefilling=[True, False, False],
     )
 
     freed = policy.on_decode_step(batch, bt)
 
-    assert freed == {}
-    assert policy._num_decode_evictions == 0
+    assert set(freed) == {"req_customer_2"}
+    assert policy._num_decode_evictions == 1
 
 
 def test_decode_gates_on_block_count_not_seq_len():

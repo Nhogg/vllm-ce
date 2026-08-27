@@ -50,10 +50,9 @@ logger = init_logger(__name__)
 PHYSICAL_EVICTION_UNIT = "whole_vllm_block"
 SCORING_UNIT = "layer_kv_head"
 
-# Synthetic request-id prefixes used by vLLM's kernel warmup (warmup_kernels,
-# req_id="_warmup_{i}_") and dummy runs (InputBatch.make_dummy, "req_{i}_...").
-# These are not real serving requests and must never be scored.
-_SYNTHETIC_REQ_PREFIXES = ("_warmup_", "req_")
+# Reserved request-id prefix used by vLLM's kernel warmup (warmup_kernels,
+# req_id="_warmup_{i}_"). Dummy runs are excluded explicitly by the model runner.
+_KERNEL_WARMUP_REQ_PREFIX = "_warmup_"
 SUMMARY_NOTE = (
     "vLLM does not support physical per-head page eviction; these are geometric "
     "score distributions, not physical per-head cache sizes."
@@ -154,7 +153,7 @@ class PrefillScorer:
         for i in range(input_batch.num_reqs):
             if not bool(input_batch.is_prefilling_np[i]):
                 continue
-            if input_batch.req_ids[i].startswith(_SYNTHETIC_REQ_PREFIXES):
+            if input_batch.req_ids[i].startswith(_KERNEL_WARMUP_REQ_PREFIX):
                 continue  # skip kernel-warmup / dummy requests
             computed = int(input_batch.num_computed_prefill_tokens_np[i])
             scheduled = int(input_batch.num_scheduled_tokens[i])
