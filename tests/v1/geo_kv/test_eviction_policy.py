@@ -1061,6 +1061,34 @@ def test_value_blend_protects_high_value_block():
     assert int(blended.argmin()) == 0
 
 
+def test_value_and_query_weights_standardize_each_raw_signal_once():
+    red = torch.tensor([-1.0, 0.0, 0.5, 3.0])
+    vnorm = torch.tensor([8.0, 1.0, 4.0, 2.0])
+    relevance = torch.tensor([0.1, 0.7, 0.0, 0.2])
+    beta = 0.6
+    query_weight = 0.4
+    cfg = GeoKVConfig.from_dict(
+        {
+            "experiment_mode": "geo_uniform",
+            "value_blend_beta": beta,
+            "query_alignment_weight": query_weight,
+        }
+    )
+    policy = object.__new__(EvictionPolicy)
+    policy.config = cfg
+
+    actual = policy._finalize_scores(red, vnorm, False, relevance)
+    expected = (
+        zscore(red) - beta * zscore(vnorm) - query_weight * zscore(relevance)
+    )
+    legacy = zscore(zscore(red) - beta * zscore(vnorm)) - query_weight * zscore(
+        relevance
+    )
+
+    assert torch.allclose(actual, expected)
+    assert not torch.allclose(actual, legacy)
+
+
 def test_config_accepts_and_rejects_redundancy_mode_and_blend():
     for mode in ("pairwise", "greedy", "coverage"):
         cfg = GeoKVConfig.from_dict(

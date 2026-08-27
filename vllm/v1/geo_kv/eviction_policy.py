@@ -1066,7 +1066,7 @@ class EvictionPolicy:
         value_l2: bool,
         query_relevance: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Apply the value-norm blend and positional-cosh re-weight to scores.
+        """Apply value/query refinements and positional weighting to scores.
 
         Shared by the main scoring path and the Phase-1C calibrator so a layer
         subset's aggregated scores go through exactly the same post-aggregation
@@ -1077,25 +1077,39 @@ class EvictionPolicy:
             vnorm: ``(count,)`` aggregated value-L2 norm, or ``None``.
             value_l2: Whether the active policy is the value_l2 baseline (which
                 skips both re-weights and keeps its raw negated norm).
+            query_relevance: ``(count,)`` query-attention mass, or ``None`` when
+                query capture did not produce a relevance signal.
 
         Returns:
             ``(count,)`` finalized droppability scores.
         """
         cfg = self.config
         blend_beta = None if value_l2 else cfg.value_blend_beta
-        # Value-norm blend: combine the redundancy droppability with the
-        # (negated) value-L2 signal on a common per-request z-scored footing so
-        # ``value_blend_beta`` is scale-free. A high-value-norm block becomes
-        # less droppable. The two signals win on disjoint task types (redundancy
-        # on span-finding QA, value-L2 on distributed-information summarization),
-        # so the blend aims to capture both. Inert when beta is None/0.
-        if blend_beta and vnorm is not None:
-            scores = zscore(scores) - float(blend_beta) * zscore(vnorm)
-        if not value_l2:
+        query_weight = None if value_l2 else cfg.query_alignment_weight
+        blend_active = bool(blend_beta and vnorm is not None)
+        query_weight_active = bool(query_weight and query_relevance is not None)
+        # Weighted refinements share one linear combination of independently
+        # standardized raw signals. In particular, do not z-score the result of
+        # the value blend again before adding query relevance: that changes the
+        # configured value/query ratio according to the blend's request-specific
+        # variance. A high value norm or query relevance lowers droppability.
+        if blend_active or query_weight_active:
+            scores = zscore(scores)
+            if blend_active:
+                assert vnorm is not None
+                assert blend_beta is not None
+                scores = scores - float(blend_beta) * zscore(vnorm)
+            if query_weight_active:
+                assert query_relevance is not None
+                assert query_weight is not None
+                scores = scores - float(query_weight) * zscore(query_relevance)
+        # Weighted mode already incorporated relevance above. As in the prior
+        # helper behavior, it takes precedence over tie-breaking.
+        if not value_l2 and not query_weight_active:
             scores = refine_with_query_relevance(
                 scores,
                 query_relevance,
-                cfg.query_alignment_weight,
+                None if blend_active else query_weight,
                 cfg.enable_query_tiebreak,
             )
         # Positional cosh (sech-bump) re-weight: pull v_redundancy eviction
