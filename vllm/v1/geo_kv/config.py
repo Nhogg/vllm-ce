@@ -274,12 +274,13 @@ class GeoKVConfig:
     dataset: str | None = None
 
     # Actual query-to-key relevance refinement. When enabled, the engine
-    # captures up to the final ``query_tail_tokens`` observed post-RoPE queries
-    # on the sampled scoring layers and lowers droppability for blocks receiving
-    # high causal QK attention mass. With prefix caching, the observed uncached
-    # suffix is used against the complete visible K cache. A positive weight uses
-    # per-request z-scored signals; tiebreak mode only separates equal redundancy
-    # scores. Both are inert by default and apply only to v_redundancy.
+    # captures up to ``query_tail_tokens`` observed post-RoPE queries since the
+    # last eviction on the sampled scoring layers and lowers droppability for
+    # blocks receiving high causal QK attention mass. With prefix caching, the
+    # observed uncached suffix is used against the complete visible K cache. A
+    # positive weight uses per-request z-scored signals; tiebreak mode only
+    # separates equal redundancy scores. Both are inert by default and apply
+    # only to v_redundancy.
     query_ema_beta: float | None = None
     query_alignment_weight: float | None = None
     enable_query_tiebreak: bool = False

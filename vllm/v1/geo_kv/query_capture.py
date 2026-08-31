@@ -11,18 +11,18 @@ import torch
 
 
 class QueryCapturer:
-    """Capture each request's observed final query suffix on sampled layers.
+    """Capture each request's recent query window on sampled layers.
 
     The model runner calls :meth:`begin_step` before the forward. Attention-layer
     hooks then call :meth:`capture`; gathered queries land in a fixed-size device
     buffer, avoiding retention of model activations. The buffer is read
     synchronously by eviction scoring immediately after the same forward.
 
-    Scheduler chunks are rolled into a window of at most ``tail_tokens``. When
-    prefix caching skips part of that window, the capturer uses the final suffix
-    that actually executes on this runner. Those queries can still attend every
-    cached key, so their QK mass is exact; unavailable cached queries are simply
-    not included in the relevance average.
+    Scheduler chunks are rolled into a window of at most ``tail_tokens`` until
+    an eviction decision resets it. When prefix caching skips part of that
+    window, the capturer uses the final suffix that actually executes on this
+    runner. Those queries can still attend every cached key, so their QK mass is
+    exact; unavailable cached queries are simply not included.
     """
 
     def __init__(
@@ -62,22 +62,26 @@ class QueryCapturer:
             dtype=dtype,
         )
         self._capture_indices = torch.empty(0, dtype=torch.long, device=device)
-        # (req_index, gathered_start, gathered_end, prefill, old_fill, new_fill)
-        self._step_entries: list[tuple[int, int, int, bool, int, int]] = []
+        # (req_index, gathered_start, gathered_end, old_fill, new_fill)
+        self._step_entries: list[tuple[int, int, int, int, int]] = []
         self._request_lengths: dict[int, int] = {}
-        self._prompt_filled = np.zeros(max_num_reqs, dtype=np.int32)
+        self._window_filled = np.zeros(max_num_reqs, dtype=np.int32)
         self._captured_rows: set[int] = set()
         self._stashed: dict[str, tuple[torch.Tensor, int]] = {}
 
     def reset_request(self, req_index: int) -> None:
-        """Clear rolling prompt-query state when a request slot is reused."""
-        self._prompt_filled[int(req_index)] = 0
+        """Clear rolling query state when a request slot is reused."""
+        self.reset_window(req_index)
+
+    def reset_window(self, req_index: int) -> None:
+        """Start a fresh query window after a permanent eviction decision."""
+        self._window_filled[int(req_index)] = 0
         self._request_lengths.pop(int(req_index), None)
 
     def stash_request(self, req_id: str, req_index: int) -> None:
         """Preserve a rolling tail across scheduler preemption/re-add."""
         idx = int(req_index)
-        filled = int(self._prompt_filled[idx])
+        filled = int(self._window_filled[idx])
         if filled:
             self._stashed[req_id] = (
                 self.buffer[:, idx, :filled].clone(),
@@ -93,7 +97,7 @@ class QueryCapturer:
         values, filled = saved
         idx = int(req_index)
         self.buffer[:, idx, :filled].copy_(values)
-        self._prompt_filled[idx] = filled
+        self._window_filled[idx] = filled
         return True
 
     def drop_request(self, req_id: str) -> None:
@@ -125,11 +129,10 @@ class QueryCapturer:
             scheduled = int(num_scheduled_tokens[i])
             if scheduled <= 0:
                 continue
-            prefill = bool(is_prefilling[i])
             req_index = int(req_index_raw)
-            old_fill = int(self._prompt_filled[req_index]) if prefill else 0
+            old_fill = int(self._window_filled[req_index])
             take = min(self.tail_tokens, scheduled)
-            new_fill = min(self.tail_tokens, old_fill + take) if prefill else take
+            new_fill = min(self.tail_tokens, old_fill + take)
             start = int(query_start_loc[i])
             source.extend(range(start + scheduled - take, start + scheduled))
             gathered_end = gathered_start + take
@@ -138,14 +141,12 @@ class QueryCapturer:
                     req_index,
                     gathered_start,
                     gathered_end,
-                    prefill,
                     old_fill,
                     new_fill,
                 )
             )
             self._request_lengths[req_index] = new_fill
-            if prefill:
-                self._prompt_filled[req_index] = new_fill
+            self._window_filled[req_index] = new_fill
             gathered_start = gathered_end
 
         if gathered_start > self.max_num_reqs * self.tail_tokens:
@@ -164,12 +165,9 @@ class QueryCapturer:
             return
         q = query.view(-1, self.num_heads, self.head_dim)
         gathered = q.index_select(0, self._capture_indices)
-        for req_index, start, end, prefill, old_fill, new_fill in self._step_entries:
+        for req_index, start, end, old_fill, new_fill in self._step_entries:
             values = gathered[start:end]
             take = end - start
-            if not prefill:
-                self.buffer[row, req_index, :take].copy_(values)
-                continue
             if take >= self.tail_tokens:
                 self.buffer[row, req_index].copy_(values[-self.tail_tokens :])
                 continue

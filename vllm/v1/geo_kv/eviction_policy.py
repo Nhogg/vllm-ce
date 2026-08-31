@@ -1402,6 +1402,17 @@ class EvictionPolicy:
             ),
         )
 
+    def _reset_r2r_query_window(
+        self, req_index: int, mask: torch.Tensor
+    ) -> None:
+        """Begin the next query window after an actual R2R eviction."""
+        if (
+            self.config.candidate_expansion_factor is not None
+            and bool(mask.any())
+            and self.query_capturer is not None
+        ):
+            self.query_capturer.reset_window(req_index)
+
     def _select_rate_mask(
         self,
         scores: torch.Tensor,
@@ -1477,6 +1488,7 @@ class EvictionPolicy:
 
             with self.profiler.section("selection"):
                 mask = _select_to_budget(scores, vnorm)
+            self._reset_r2r_query_window(req_index, mask)
             if self.layer_calibrator.enabled:
                 self._calibrate_layers(mask, _select_to_budget)
             with self.profiler.section("transfer"):
@@ -1516,6 +1528,7 @@ class EvictionPolicy:
 
         with self.profiler.section("selection"):
             mask = _select(scores, vnorm)
+        self._reset_r2r_query_window(req_index, mask)
         if self.layer_calibrator.enabled:
             self._calibrate_layers(mask, _select)
         self.evicted_store[req_index, :count].copy_(mask.to(self.evicted_store.device))
@@ -1687,6 +1700,7 @@ class EvictionPolicy:
                 mask = self._select_budget_mask(scores, count, budget, vnorm)
             if not bool(mask.any()):
                 return []
+            self._reset_r2r_query_window(req_index, mask)
             self._num_decode_evictions += 1
             self.evicted_store[req_index, :count].copy_(
                 mask.to(self.evicted_store.device)

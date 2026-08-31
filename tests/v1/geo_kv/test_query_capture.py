@@ -60,6 +60,52 @@ def test_query_capture_rolls_query_tail_across_prefill_chunks():
     assert torch.equal(cap.get(2, 3), torch.cat((first[-2:], second)))
 
 
+def test_query_capture_accumulates_decode_queries_since_eviction():
+    cap = _capturer(tail_tokens=4)
+    captured = []
+    for step in range(3):
+        cap.begin_step(
+            np.array([2], dtype=np.int32),
+            np.array([0, 1], dtype=np.int32),
+            np.array([1], dtype=np.int32),
+            np.array([5 + step], dtype=np.int32),
+            np.array([5], dtype=np.int32),
+            np.array([False]),
+        )
+        query = torch.full((1, 2, 2), float(step + 1))
+        captured.append(query)
+        cap.capture(3, query)
+
+    assert torch.equal(cap.get(2, 3), torch.cat(captured))
+
+
+def test_query_capture_reset_window_starts_after_current_eviction():
+    cap = _capturer(tail_tokens=4)
+    cap.begin_step(
+        np.array([2], dtype=np.int32),
+        np.array([0, 2], dtype=np.int32),
+        np.array([2], dtype=np.int32),
+        np.array([0], dtype=np.int32),
+        np.array([2], dtype=np.int32),
+        np.array([True]),
+    )
+    cap.capture(3, torch.ones(2, 2, 2))
+    cap.reset_window(2)
+    assert cap.get(2, 3) is None
+
+    cap.begin_step(
+        np.array([2], dtype=np.int32),
+        np.array([0, 1], dtype=np.int32),
+        np.array([1], dtype=np.int32),
+        np.array([2], dtype=np.int32),
+        np.array([2], dtype=np.int32),
+        np.array([False]),
+    )
+    query = torch.full((1, 2, 2), 7.0)
+    cap.capture(3, query)
+    assert torch.equal(cap.get(2, 3), query)
+
+
 def test_query_capture_uses_observed_suffix_after_cached_prefix():
     cap = _capturer(tail_tokens=4)
     cap.begin_step(
