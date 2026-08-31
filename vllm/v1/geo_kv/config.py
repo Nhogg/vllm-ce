@@ -291,9 +291,9 @@ class GeoKVConfig:
     # None is inert. Applies only to budget-based pairwise V-redundancy.
     query_relevance_protect_quantile: float | None = None
     # R2R Stage 1 candidate expansion factor. When set, shortlist
-    # ``round(factor * blocks_to_evict)`` blocks by pairwise value redundancy,
-    # then evict the least query-relevant blocks from that shortlist. ``1`` is
-    # exactly the pinned pure-redundancy selector. None disables R2R.
+    # ``round(factor * blocks_to_evict)`` blocks by lowest value projection-
+    # residual cost, then evict the least query-relevant blocks from that
+    # shortlist. ``1`` is pure residual-cost selection. None disables R2R.
     candidate_expansion_factor: float | None = None
     # Number of ranked covering blocks consulted by the R2R guard. Zero disables
     # the guard; two matches the algorithm default. The guard remains exact-budget

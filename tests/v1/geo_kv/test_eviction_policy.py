@@ -28,6 +28,7 @@ from vllm.v1.geo_kv.scoring import (
     block_joint_similarity,
     block_key_anchor_relevance,
     block_multi_prototype_redundancy,
+    block_pair_residual_cost,
     block_prototypes,
     block_query_attention_mass,
     block_value_l2,
@@ -103,6 +104,37 @@ def test_block_key_anchor_relevance_rejects_incompatible_gqa_shapes():
         )
 
 
+def test_block_pair_residual_cost_uses_magnitude_and_absolute_cosine():
+    anchors = torch.tensor(
+        [
+            [[1.0, 0.0]],
+            [[-1.0, 0.0]],
+            [[0.0, 2.0]],
+        ]
+    )
+
+    cost = block_pair_residual_cost(anchors)
+
+    assert torch.isinf(cost.diagonal()).all()
+    torch.testing.assert_close(cost[0, 1], torch.tensor(0.0))
+    torch.testing.assert_close(cost[1, 0], torch.tensor(0.0))
+    torch.testing.assert_close(cost[2, 0], torch.tensor(2.0))
+
+
+def test_block_pair_residual_cost_is_conservative_across_heads():
+    anchors = torch.tensor(
+        [
+            [[1.0, 0.0], [0.0, 3.0]],
+            [[1.0, 0.0], [3.0, 0.0]],
+        ]
+    )
+
+    cost = block_pair_residual_cost(anchors)
+
+    # Head 0 is perfectly covered, but head 1 loses its full magnitude.
+    torch.testing.assert_close(cost[0, 1], torch.tensor(3.0))
+
+
 def test_query_relevance_refinement_is_inert_weighted_and_tie_only():
     scores = torch.tensor([0.1, 0.8, 0.8, 1.2])
     relevance = torch.tensor([0.0, 0.9, 0.1, 1.0])
@@ -118,7 +150,7 @@ def test_query_relevance_refinement_is_inert_weighted_and_tie_only():
 
 
 def test_r2r_selects_least_relevant_from_redundancy_shortlist():
-    scores = torch.tensor([0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.0])
+    scores = torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 9.0])
     relevance = torch.tensor([0.9, 0.8, 0.1, 0.2, 0.0, 0.3, 0.4, 1.0])
 
     mask = select_evicted_r2r(
@@ -134,12 +166,8 @@ def test_r2r_selects_least_relevant_from_redundancy_shortlist():
 
 
 def test_r2r_factor_one_matches_pure_redundancy():
-    scores = torch.tensor([0.2, 0.9, 0.4, 0.8, 0.1, 0.7, 0.3, 0.0])
+    scores = torch.tensor([0.2, 0.1, 0.4, 0.3, 0.8, 0.7, 0.6, 9.0])
     relevance = torch.tensor([0.0, 0.9, 0.1, 0.8, 0.2, 0.7, 0.3, 1.0])
-    expected = select_evicted_to_budget(
-        scores, num_blocks=8, budget=5, warmup_pages=1
-    )
-
     actual = select_evicted_r2r(
         scores,
         relevance,
@@ -149,7 +177,7 @@ def test_r2r_factor_one_matches_pure_redundancy():
         candidate_expansion_factor=1.0,
     )
 
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert torch.nonzero(actual).flatten().tolist() == [1, 2, 3]
 
 
 def test_r2r_large_factor_becomes_pure_relevance_and_keeps_protections():
@@ -173,7 +201,7 @@ def test_r2r_large_factor_becomes_pure_relevance_and_keeps_protections():
 
 
 def test_r2r_twin_guard_keeps_one_duplicate_and_backfills():
-    scores = torch.tensor([1.0, 1.0, 0.9, 0.8, 0.1, 0.0])
+    scores = torch.tensor([0.0, 0.0, 0.1, 0.2, 0.9, 1.0])
     relevance = torch.tensor([0.0, 0.1, 0.2, 0.3, 0.9, 1.0])
     similarity = torch.eye(6)
     similarity[0, 1] = similarity[1, 0] = 0.99
@@ -203,7 +231,7 @@ def test_r2r_twin_guard_keeps_one_duplicate_and_backfills():
 
 
 def test_r2r_twin_guard_falls_back_to_preserve_exact_budget():
-    scores = torch.tensor([1.0, 1.0, 0.2, 0.0])
+    scores = torch.tensor([0.0, 0.0, 0.2, 1.0])
     relevance = torch.tensor([0.0, 0.1, 0.9, 1.0])
     similarity = torch.eye(4)
     similarity[0, 1] = similarity[1, 0] = 0.99
@@ -223,7 +251,7 @@ def test_r2r_twin_guard_falls_back_to_preserve_exact_budget():
 
 
 def test_r2r_cover_depth_zero_disables_guard():
-    scores = torch.tensor([1.0, 1.0, 0.9, 0.8, 0.1, 0.0])
+    scores = torch.tensor([0.0, 0.0, 0.1, 0.2, 0.9, 1.0])
     relevance = torch.tensor([0.0, 0.1, 0.2, 0.3, 0.9, 1.0])
     similarity = torch.eye(6)
     similarity[0, 1] = similarity[1, 0] = 0.99
@@ -243,7 +271,7 @@ def test_r2r_cover_depth_zero_disables_guard():
 
 
 def test_r2r_second_cover_allows_eviction_on_later_pass():
-    scores = torch.tensor([1.0, 0.9, 0.8, 0.1, 0.0])
+    scores = torch.tensor([0.0, 0.1, 0.2, 0.9, 1.0])
     relevance = torch.tensor([0.0, 0.1, 0.2, 0.9, 1.0])
     similarity = torch.eye(5)
     similarity[0, 1] = similarity[1, 0] = 0.99
@@ -282,7 +310,7 @@ def test_r2r_second_cover_allows_eviction_on_later_pass():
 
 
 def test_r2r_cover_ranking_treats_anti_alignment_as_coverage():
-    scores = torch.tensor([1.0, 0.9, 0.8, 0.0])
+    scores = torch.tensor([0.0, 0.1, 0.2, 1.0])
     relevance = torch.tensor([0.0, 0.1, 0.2, 1.0])
     similarity = torch.eye(4)
     similarity[0, 1] = similarity[1, 0] = -0.99

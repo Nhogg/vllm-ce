@@ -418,6 +418,36 @@ def block_joint_similarity(anchors: torch.Tensor) -> torch.Tensor:
     return normalized @ normalized.t()
 
 
+def block_pair_residual_cost(anchors: torch.Tensor) -> torch.Tensor:
+    """Projection-residual cost for every block/cover pair.
+
+    The updated R2R score is per head. vLLM evicts a physical block shared by
+    every KV head, so a covering block is charged the largest residual loss over
+    heads. Candidate ``i`` then uses the cheapest covering block ``j``.
+
+    Args:
+        anchors: Mean-pooled values shaped ``(B, H, D)``.
+
+    Returns:
+        ``(B, B)`` pair costs. Entry ``[i, j]`` is the worst-head residual loss
+        for evicting block ``i`` while retaining cover ``j``. The diagonal is
+        positive infinity so a block cannot cover itself.
+    """
+    block_count = anchors.shape[0]
+    values = anchors.to(torch.float32)
+    norms = torch.linalg.vector_norm(values, dim=-1)  # (B, H)
+    normalized = torch.nn.functional.normalize(values, dim=-1)
+    # (H, B, B): cosine for each head and ordered block pair.
+    cosine = torch.einsum("bhd,chd->hbc", normalized, normalized)
+    unexplained = torch.sqrt(torch.clamp(1.0 - cosine.square(), min=0.0))
+    per_head_cost = norms.transpose(0, 1).unsqueeze(-1) * unexplained
+    pair_cost = per_head_cost.amax(dim=0)
+    pair_cost.fill_diagonal_(float("inf"))
+    if block_count < 2:
+        return torch.full_like(pair_cost, float("inf"))
+    return pair_cost
+
+
 def block_joint_redundancy_greedy(
     anchors: torch.Tensor,
     protect: torch.Tensor | None = None,

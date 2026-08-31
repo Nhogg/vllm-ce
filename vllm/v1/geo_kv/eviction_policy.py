@@ -49,6 +49,7 @@ from vllm.v1.geo_kv.scoring import (
     block_joint_similarity,
     block_key_anchor_relevance,
     block_multi_prototype_redundancy,
+    block_pair_residual_cost,
     block_prototypes,
     block_query_attention_mass,
     block_valid_lens,
@@ -435,17 +436,20 @@ def select_evicted_r2r(
     candidate_expansion_factor: float,
     tail_protect_frac: float | None = None,
     similarity: torch.Tensor | None = None,
+    cover_cost: torch.Tensor | None = None,
     cover_depth: int = 2,
     selection_stats: dict[str, int] | None = None,
 ) -> torch.Tensor:
     """Evict least-relevant blocks from a redundancy-ranked shortlist.
 
-    Stage 1 selects up to ``round(factor * k)`` of the most value-redundant
-    blocks, where ``k`` is the exact number required by the budget. Stage 2
+    Stage 1 selects up to ``round(factor * k)`` of the lowest projection-
+    residual-cost blocks, where ``k`` is the exact number required by the
+    budget. Stage 2
     evicts the ``k`` least query-relevant candidates. When ``similarity`` is
-    provided, a top-``cover_depth`` guard avoids evicting all available covers
-    of a candidate when another candidate can satisfy the budget. Cover ranking
-    uses absolute cosine, matching the squared projection-residual definition.
+    or ``cover_cost`` is provided, a top-``cover_depth`` guard avoids evicting
+    all available covers of a candidate when another candidate can satisfy the
+    budget. Legacy similarity input ranks by absolute cosine; production R2R
+    ranks the same projection-residual pair costs used by Stage 1.
     Sink, final-anchor, and clamped tail protections match
     :func:`select_evicted_to_budget`.
     """
@@ -482,8 +486,8 @@ def select_evicted_r2r(
         window_size,
     )
 
-    redundancy = scores.detach()[lo:hi].to(torch.float32)
-    candidate_order = torch.argsort(redundancy, descending=True, stable=True)
+    residual_cost = scores.detach()[lo:hi].to(torch.float32)
+    candidate_order = torch.argsort(residual_cost, descending=False, stable=True)
     candidates = candidate_order[:candidate_count] + lo
     relevance = query_relevance.detach().to(
         device=candidates.device, dtype=torch.float32
@@ -492,28 +496,40 @@ def select_evicted_r2r(
         relevance[candidates], descending=False, stable=True
     )
     ranked_candidates = candidates[relevance_order]
-    if similarity is None or cover_depth == 0:
+    if similarity is None and cover_cost is None:
+        chosen = ranked_candidates[:k].to(device="cpu")
+        if selection_stats is not None:
+            selection_stats["unguarded"] = k
+    elif cover_depth == 0:
         chosen = ranked_candidates[:k].to(device="cpu")
         if selection_stats is not None:
             selection_stats["unguarded"] = k
     else:
-        if similarity.shape != (num_blocks, num_blocks):
-            raise ValueError("R2R similarity must be square and match num_blocks")
+        cover_matrix = cover_cost if cover_cost is not None else similarity
+        assert cover_matrix is not None
+        if cover_matrix.shape != (num_blocks, num_blocks):
+            raise ValueError("R2R cover matrix must be square and match num_blocks")
         depth = min(int(cover_depth), max(num_blocks - 1, 0))
         # Only candidate rows are needed. Keep the O(n*b*B) gather and cover
         # ranking on GPU, then transfer the small decision table once. The guard
         # is order-dependent within each pass, so a Python loop is appropriate
         # on CPU; doing bool(tensor) here would synchronize the GPU per candidate.
-        candidate_similarity = similarity.detach().to(
+        candidate_scores = cover_matrix.detach().to(
             device=ranked_candidates.device, dtype=torch.float32
         ).index_select(0, ranked_candidates)
-        candidate_similarity = candidate_similarity.abs()
+        if cover_cost is None:
+            candidate_scores = candidate_scores.abs()
         rows = torch.arange(
             ranked_candidates.numel(), device=ranked_candidates.device
         )
-        candidate_similarity[rows, ranked_candidates] = float("-inf")
+        candidate_scores[rows, ranked_candidates] = (
+            float("inf") if cover_cost is not None else float("-inf")
+        )
         ranked_covers = torch.argsort(
-            candidate_similarity, dim=1, descending=True, stable=True
+            candidate_scores,
+            dim=1,
+            descending=cover_cost is None,
+            stable=True,
         )[:, :depth]
         decision_table = torch.cat(
             (ranked_candidates[:, None], ranked_covers), dim=1
@@ -769,6 +785,7 @@ class EvictionPolicy:
         self._cal_row_layer_idxs: list[int] = []
         # Per-fire global similarity matrix for coverage or R2R cover selection.
         self._coverage_similarity: torch.Tensor | None = None
+        self._r2r_cover_cost: torch.Tensor | None = None
         # Raw causal QK attention mass for hard relevance protection. It remains
         # separate from finalized scores so positional cosh can compose without
         # changing which high-relevance blocks the hard constraint protects.
@@ -957,6 +974,7 @@ class EvictionPolicy:
         """
         cfg = self.config
         self._coverage_similarity = None
+        self._r2r_cover_cost = None
         self._query_relevance = None
         value_l2 = cfg.eviction_policy == "value_l2"
         greedy = (not value_l2) and cfg.redundancy_mode == "greedy"
@@ -974,6 +992,7 @@ class EvictionPolicy:
         per_layer_vnorm: list[torch.Tensor] = []  # populated when want_vnorm
         per_layer_query: list[torch.Tensor] = []  # populated when available
         per_layer_similarity: list[torch.Tensor] = []
+        per_layer_cover_cost: list[torch.Tensor] = []
         query_window_len: int | None = None
         scored_layer_idxs: list[int] = []  # global layer idx per per_layer row
         prof = self.profiler
@@ -1095,7 +1114,7 @@ class EvictionPolicy:
                         )
                     )
             with prof.section("similarity"):
-                if coverage_mode or r2r_mode:
+                if coverage_mode:
                     assert anchors is not None
                     similarity = block_joint_similarity(anchors)
                     per_layer_similarity.append(similarity)
@@ -1105,6 +1124,11 @@ class EvictionPolicy:
                         .max(dim=1)
                         .values
                     )
+                elif r2r_mode:
+                    assert anchors is not None
+                    pair_cost = block_pair_residual_cost(anchors)
+                    per_layer_cover_cost.append(pair_cost)
+                    per_layer.append(pair_cost.amin(dim=1))
                 elif greedy:
                     assert anchors is not None
                     # Keep sink + anchor in the comparison set (a block that
@@ -1169,6 +1193,15 @@ class EvictionPolicy:
                     cfg.block_score_aggregation,
                     cfg.topk_frac,
                 )
+            if per_layer_cover_cost:
+                self._r2r_cover_cost = aggregate_layer_scores(
+                    torch.stack(per_layer_cover_cost, dim=0),
+                    cfg.block_score_aggregation,
+                    cfg.topk_frac,
+                )
+                # Keep candidate scores and guard covers consistent: choose the
+                # cheapest cover only after aggregating its cost across layers.
+                scores = self._r2r_cover_cost.amin(dim=1)
         if (
             cfg.query_relevance_protect_quantile is not None
             and query_relevance is None
@@ -1332,10 +1365,10 @@ class EvictionPolicy:
                 budget,
                 int(cfg.warmup_pages or 0),
                 cfg.candidate_expansion_factor,
-                cfg.query_tail_protect_frac,
-                self._coverage_similarity,
-                cfg.r2r_cover_depth,
-                fire_stats,
+                tail_protect_frac=cfg.query_tail_protect_frac,
+                cover_cost=self._r2r_cover_cost,
+                cover_depth=cfg.r2r_cover_depth,
+                selection_stats=fire_stats,
             )
             for key, value in fire_stats.items():
                 self._r2r_selection_counts[key] = (
