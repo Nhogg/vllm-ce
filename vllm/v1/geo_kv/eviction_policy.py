@@ -47,6 +47,7 @@ from vllm.v1.geo_kv.scoring import (
     block_joint_redundancy,
     block_joint_redundancy_greedy,
     block_joint_similarity,
+    block_key_anchor_relevance,
     block_multi_prototype_redundancy,
     block_prototypes,
     block_query_attention_mass,
@@ -434,20 +435,32 @@ def select_evicted_r2r(
     candidate_expansion_factor: float,
     tail_protect_frac: float | None = None,
     similarity: torch.Tensor | None = None,
+    cover_depth: int = 2,
+    selection_stats: dict[str, int] | None = None,
 ) -> torch.Tensor:
     """Evict least-relevant blocks from a redundancy-ranked shortlist.
 
     Stage 1 selects up to ``round(factor * k)`` of the most value-redundant
     blocks, where ``k`` is the exact number required by the budget. Stage 2
     evicts the ``k`` least query-relevant candidates. When ``similarity`` is
-    provided, a best-cover guard avoids evicting both sides of a duplicate pair
-    when another candidate can satisfy the budget. Sink, final-anchor, and
-    clamped tail protections match :func:`select_evicted_to_budget`.
+    provided, a top-``cover_depth`` guard avoids evicting all available covers
+    of a candidate when another candidate can satisfy the budget. Cover ranking
+    uses absolute cosine, matching the squared projection-residual definition.
+    Sink, final-anchor, and clamped tail protections match
+    :func:`select_evicted_to_budget`.
     """
     if scores.shape != (num_blocks,) or query_relevance.shape != (num_blocks,):
         raise ValueError("R2R scores and query relevance must match num_blocks")
+    if selection_stats is not None:
+        selection_stats.clear()
     if candidate_expansion_factor < 1.0:
         raise ValueError("R2R candidate expansion factor must be >= 1")
+    if (
+        not isinstance(cover_depth, int)
+        or isinstance(cover_depth, bool)
+        or cover_depth < 0
+    ):
+        raise ValueError("R2R cover depth must be an integer >= 0")
     evict = torch.zeros(num_blocks, dtype=torch.bool)
     if num_blocks <= budget:
         return evict
@@ -479,32 +492,65 @@ def select_evicted_r2r(
         relevance[candidates], descending=False, stable=True
     )
     ranked_candidates = candidates[relevance_order]
-    if similarity is None:
+    if similarity is None or cover_depth == 0:
         chosen = ranked_candidates[:k].to(device="cpu")
+        if selection_stats is not None:
+            selection_stats["unguarded"] = k
     else:
         if similarity.shape != (num_blocks, num_blocks):
             raise ValueError("R2R similarity must be square and match num_blocks")
-        sim = similarity.detach().to(
+        depth = min(int(cover_depth), max(num_blocks - 1, 0))
+        # Only candidate rows are needed. Keep the O(n*b*B) gather and cover
+        # ranking on GPU, then transfer the small decision table once. The guard
+        # is order-dependent within each pass, so a Python loop is appropriate
+        # on CPU; doing bool(tensor) here would synchronize the GPU per candidate.
+        candidate_similarity = similarity.detach().to(
             device=ranked_candidates.device, dtype=torch.float32
-        ).clone()
-        sim.fill_diagonal_(float("-inf"))
-        best_cover = sim.argmax(dim=1)
-        alive = torch.ones(num_blocks, dtype=torch.bool, device=sim.device)
-        guarded: list[int] = []
-        skipped: list[int] = []
-        for candidate in ranked_candidates.tolist():
-            if bool(alive[best_cover[candidate]]):
-                guarded.append(candidate)
-                alive[candidate] = False
-                if len(guarded) == k:
-                    break
-            else:
-                skipped.append(candidate)
-        # Exact memory matching takes priority when the shortlist cannot supply
-        # k cover-safe choices (for example n=1 with both twins shortlisted).
-        if len(guarded) < k:
-            guarded.extend(skipped[: k - len(guarded)])
-        chosen = torch.tensor(guarded, dtype=torch.long, device="cpu")
+        ).index_select(0, ranked_candidates)
+        candidate_similarity = candidate_similarity.abs()
+        rows = torch.arange(
+            ranked_candidates.numel(), device=ranked_candidates.device
+        )
+        candidate_similarity[rows, ranked_candidates] = float("-inf")
+        ranked_covers = torch.argsort(
+            candidate_similarity, dim=1, descending=True, stable=True
+        )[:, :depth]
+        decision_table = torch.cat(
+            (ranked_candidates[:, None], ranked_covers), dim=1
+        ).to(device="cpu")
+        decision_rows = decision_table.tolist()
+
+        chosen_list: list[int] = []
+        chosen_set: set[int] = set()
+        for cover_rank in range(depth):
+            for decision in decision_rows:
+                candidate = decision[0]
+                if candidate in chosen_set:
+                    continue
+                if decision[cover_rank + 1] not in chosen_set:
+                    chosen_list.append(candidate)
+                    chosen_set.add(candidate)
+                    if selection_stats is not None:
+                        key = f"cover_{cover_rank + 1}"
+                        selection_stats[key] = selection_stats.get(key, 0) + 1
+                    if len(chosen_list) == k:
+                        break
+            if len(chosen_list) == k:
+                break
+        # Final unguarded pass preserves exact matched memory.
+        if len(chosen_list) < k:
+            for decision in decision_rows:
+                candidate = decision[0]
+                if candidate not in chosen_set:
+                    chosen_list.append(candidate)
+                    chosen_set.add(candidate)
+                    if selection_stats is not None:
+                        selection_stats["backfill"] = (
+                            selection_stats.get("backfill", 0) + 1
+                        )
+                    if len(chosen_list) == k:
+                        break
+        chosen = torch.tensor(chosen_list, dtype=torch.long, device="cpu")
     evict[chosen] = True
     return evict
 
@@ -721,14 +767,14 @@ class EvictionPolicy:
         self._cal_stacked: torch.Tensor | None = None
         self._cal_vnorm_stacked: torch.Tensor | None = None
         self._cal_row_layer_idxs: list[int] = []
-        # Per-fire global similarity matrix for the corrected facility-location
-        # selector. Populated only by redundancy_mode="coverage".
+        # Per-fire global similarity matrix for coverage or R2R cover selection.
         self._coverage_similarity: torch.Tensor | None = None
         # Raw causal QK attention mass for hard relevance protection. It remains
         # separate from finalized scores so positional cosh can compose without
         # changing which high-relevance blocks the hard constraint protects.
         self._query_relevance: torch.Tensor | None = None
         self._num_requests_evicted = 0
+        self._r2r_selection_counts: dict[str, int] = {}
         # Decode-time eviction counters/throttle (mask-only).
         self._decode_step = 0
         self._num_decode_evictions = 0
@@ -1035,8 +1081,13 @@ class EvictionPolicy:
                 assert k is not None
                 query_window_len = int(queries.shape[0])
                 with prof.section("query_attention"):
+                    relevance_fn = (
+                        block_key_anchor_relevance
+                        if cfg.r2r_relevance_signal == "key_anchor"
+                        else block_query_attention_mass
+                    )
                     per_layer_query.append(
-                        block_query_attention_mass(
+                        relevance_fn(
                             queries,
                             k,
                             valid,
@@ -1273,7 +1324,8 @@ class EvictionPolicy:
             relevance = self._query_relevance
             if relevance is None:
                 raise RuntimeError("R2R selection missing query relevance")
-            return select_evicted_r2r(
+            fire_stats: dict[str, int] = {}
+            mask = select_evicted_r2r(
                 scores,
                 relevance,
                 count,
@@ -1282,7 +1334,14 @@ class EvictionPolicy:
                 cfg.candidate_expansion_factor,
                 cfg.query_tail_protect_frac,
                 self._coverage_similarity,
+                cfg.r2r_cover_depth,
+                fire_stats,
             )
+            for key, value in fire_stats.items():
+                self._r2r_selection_counts[key] = (
+                    self._r2r_selection_counts.get(key, 0) + value
+                )
+            return mask
         if cfg.redundancy_mode == "coverage":
             similarity = self._coverage_similarity
             if similarity is None:
@@ -1647,9 +1706,10 @@ class EvictionPolicy:
     def close(self) -> None:
         logger.info(
             "[geo_kv] EvictionPolicy closed: evicted %d requests "
-            "(prefill), %d decode-eviction events",
+            "(prefill), %d decode-eviction events, R2R reasons=%s",
             self._num_requests_evicted,
             self._num_decode_evictions,
+            self._r2r_selection_counts,
         )
         # Flush the Phase-1B scorer profile (no-op unless enable_tracing).
         self.profiler.dump()

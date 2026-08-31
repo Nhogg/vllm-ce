@@ -600,6 +600,43 @@ def block_query_attention_mass(
     return mass.to(torch.float32)
 
 
+def block_key_anchor_relevance(
+    queries: torch.Tensor,
+    k_blocks: torch.Tensor,
+    valid_lens: torch.Tensor,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """Score whole blocks by query dot mean-pooled post-RoPE keys.
+
+    Args:
+        queries: Post-RoPE queries shaped ``(W, Hq, D)``.
+        k_blocks: Post-RoPE keys shaped ``(B, S, Hkv, D)``.
+        valid_lens: Valid token count per block, shaped ``(B,)``.
+        scale: Query-key scale. Defaults to ``D**-0.5``.
+
+    Returns:
+        ``(B,)`` peak query-to-key-anchor relevance over query tokens and heads.
+        The max is the conservative whole-block reduction required by vLLM's
+        shared physical block after computing per-head dot products.
+
+    Raises:
+        ValueError: If query and key shapes are incompatible with GQA.
+    """
+    if queries.ndim != 3 or k_blocks.ndim != 4:
+        raise ValueError("queries must be (W,Hq,D) and k_blocks (B,S,Hkv,D)")
+    W, Hq, D = queries.shape
+    B, _, Hkv, key_dim = k_blocks.shape
+    if W < 1 or B < 1 or key_dim != D or Hq % Hkv != 0:
+        raise ValueError(
+            "query/key shapes require W,B >= 1, equal head dims, and Hq % Hkv == 0"
+        )
+    anchors = block_anchors(k_blocks, valid_lens)
+    q = queries.to(torch.float32).reshape(W, Hkv, Hq // Hkv, D)
+    relevance = torch.einsum("whgd,bhd->whgb", q, anchors).amax(dim=(0, 1, 2))
+    relevance.mul_(float(scale) if scale is not None else D**-0.5)
+    return relevance.to(torch.float32)
+
+
 def refine_with_query_relevance(
     scores: torch.Tensor,
     relevance: torch.Tensor | None,

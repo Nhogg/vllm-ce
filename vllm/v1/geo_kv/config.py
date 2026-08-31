@@ -57,6 +57,7 @@ OVERFLOW_EVICTION_MODES = ("repeated_single",)
 # the Paged-Eviction baseline (drop lowest value-L2-norm blocks), ported into the
 # V1 capacity-band path for a matched-memory contrast against v_redundancy.
 EVICTION_POLICIES = ("v_redundancy", "recency", "random", "value_l2")
+R2R_RELEVANCE_SIGNALS = ("attention_mass", "key_anchor")
 # Mirror of scoring.NORM_VARIANTS, duplicated so config stays import-light
 # (no torch). Kept in sync by the norm_variants validation test.
 NORM_VARIANT_CHOICES = ("raw", "center_request", "whiten_request")
@@ -294,6 +295,13 @@ class GeoKVConfig:
     # then evict the least query-relevant blocks from that shortlist. ``1`` is
     # exactly the pinned pure-redundancy selector. None disables R2R.
     candidate_expansion_factor: float | None = None
+    # Number of ranked covering blocks consulted by the R2R guard. Zero disables
+    # the guard; two matches the algorithm default. The guard remains exact-budget
+    # through an unguarded final backfill pass.
+    r2r_cover_depth: int = 2
+    # Stage-2 relevance signal. Exact causal attention mass is the established
+    # default; key_anchor is the cheaper spec-literal Q dot MeanPool(K) ablation.
+    r2r_relevance_signal: str = "attention_mass"
     query_tail_tokens: int = 32
     # Tail-protect (recency floor) for the budget path: never V-evict the last
     # ``ceil(query_tail_protect_frac * num_blocks)`` blocks of a request. The
@@ -406,6 +414,11 @@ class GeoKVConfig:
             OVERFLOW_EVICTION_MODES,
         )
         _check_choice("eviction_policy", self.eviction_policy, EVICTION_POLICIES)
+        _check_choice(
+            "r2r_relevance_signal",
+            self.r2r_relevance_signal,
+            R2R_RELEVANCE_SIGNALS,
+        )
         _check_choice(
             "value_l2_block_reduction",
             self.value_l2_block_reduction,
@@ -603,6 +616,24 @@ class GeoKVConfig:
                     "geo_kv.candidate_expansion_factor requires "
                     "physical_reclaim when decode eviction is active"
                 )
+        elif self.r2r_relevance_signal != "attention_mass":
+            raise ValueError(
+                "geo_kv.r2r_relevance_signal requires "
+                "candidate_expansion_factor"
+            )
+        if (
+            not isinstance(self.r2r_cover_depth, int)
+            or isinstance(self.r2r_cover_depth, bool)
+            or self.r2r_cover_depth < 0
+        ):
+            raise ValueError("geo_kv.r2r_cover_depth must be an integer >= 0")
+        if (
+            self.candidate_expansion_factor is None
+            and self.r2r_cover_depth != 2
+        ):
+            raise ValueError(
+                "geo_kv.r2r_cover_depth requires candidate_expansion_factor"
+            )
         if self.query_relevance_protect_quantile is not None:
             budget_selection_active = (
                 self.prefill_evict_frac is not None

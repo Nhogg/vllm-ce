@@ -26,6 +26,7 @@ from vllm.v1.geo_kv.scoring import (
     block_joint_redundancy,
     block_joint_redundancy_greedy,
     block_joint_similarity,
+    block_key_anchor_relevance,
     block_multi_prototype_redundancy,
     block_prototypes,
     block_query_attention_mass,
@@ -66,6 +67,40 @@ def test_block_query_attention_mass_is_causal_and_gqa_aware():
     assert mass.shape == (2,)
     assert torch.isclose(mass.sum(), torch.tensor(1.0), atol=1e-6)
     assert mass[0] > mass[1]
+
+
+def test_block_key_anchor_relevance_masks_partial_blocks_and_supports_gqa():
+    queries = torch.tensor([[[1.0, 0.0]] * 4, [[1.0, 0.0]] * 4])
+    keys = torch.zeros(2, 2, 2, 2)
+    keys[0, 0, :, 0] = 2.0
+    keys[0, 1, :, 0] = -100.0  # padding in the one-token partial block
+    keys[1, :, :, 0] = 1.0
+
+    relevance = block_key_anchor_relevance(
+        queries, keys, torch.tensor([1, 2]), scale=1.0
+    )
+
+    torch.testing.assert_close(relevance, torch.tensor([2.0, 1.0]))
+
+
+def test_block_key_anchor_relevance_uses_peak_query_not_mean():
+    queries = torch.tensor([[[1.0, 0.0]], [[0.0, 1.0]]])
+    keys = torch.tensor([[[[4.0, 0.0]]], [[[0.0, 3.0]]]])
+
+    relevance = block_key_anchor_relevance(
+        queries, keys, torch.tensor([1, 1]), scale=1.0
+    )
+
+    torch.testing.assert_close(relevance, torch.tensor([4.0, 3.0]))
+
+
+def test_block_key_anchor_relevance_rejects_incompatible_gqa_shapes():
+    with pytest.raises(ValueError, match="Hq % Hkv"):
+        block_key_anchor_relevance(
+            torch.zeros(1, 3, 2),
+            torch.zeros(2, 2, 2, 2),
+            torch.tensor([2, 2]),
+        )
 
 
 def test_query_relevance_refinement_is_inert_weighted_and_tie_only():
@@ -187,6 +222,88 @@ def test_r2r_twin_guard_falls_back_to_preserve_exact_budget():
     assert int(mask.sum()) == 2
 
 
+def test_r2r_cover_depth_zero_disables_guard():
+    scores = torch.tensor([1.0, 1.0, 0.9, 0.8, 0.1, 0.0])
+    relevance = torch.tensor([0.0, 0.1, 0.2, 0.3, 0.9, 1.0])
+    similarity = torch.eye(6)
+    similarity[0, 1] = similarity[1, 0] = 0.99
+
+    mask = select_evicted_r2r(
+        scores,
+        relevance,
+        num_blocks=6,
+        budget=4,
+        warmup_pages=0,
+        candidate_expansion_factor=2.0,
+        similarity=similarity,
+        cover_depth=0,
+    )
+
+    assert torch.nonzero(mask).flatten().tolist() == [0, 1]
+
+
+def test_r2r_second_cover_allows_eviction_on_later_pass():
+    scores = torch.tensor([1.0, 0.9, 0.8, 0.1, 0.0])
+    relevance = torch.tensor([0.0, 0.1, 0.2, 0.9, 1.0])
+    similarity = torch.eye(5)
+    similarity[0, 1] = similarity[1, 0] = 0.99
+    similarity[1, 3] = similarity[3, 1] = 0.8
+    similarity[2, 0] = similarity[0, 2] = 0.7
+
+    depth_one_stats: dict[str, int] = {}
+    depth_one = select_evicted_r2r(
+        scores,
+        relevance,
+        num_blocks=5,
+        budget=2,
+        warmup_pages=0,
+        candidate_expansion_factor=1.0,
+        similarity=similarity,
+        cover_depth=1,
+        selection_stats=depth_one_stats,
+    )
+    depth_two_stats: dict[str, int] = {}
+    depth_two = select_evicted_r2r(
+        scores,
+        relevance,
+        num_blocks=5,
+        budget=2,
+        warmup_pages=0,
+        candidate_expansion_factor=1.0,
+        similarity=similarity,
+        cover_depth=2,
+        selection_stats=depth_two_stats,
+    )
+
+    assert int(depth_one.sum()) == 3
+    assert int(depth_two.sum()) == 3
+    assert depth_one_stats == {"cover_1": 1, "backfill": 2}
+    assert depth_two_stats == {"cover_1": 1, "cover_2": 1, "backfill": 1}
+
+
+def test_r2r_cover_ranking_treats_anti_alignment_as_coverage():
+    scores = torch.tensor([1.0, 0.9, 0.8, 0.0])
+    relevance = torch.tensor([0.0, 0.1, 0.2, 1.0])
+    similarity = torch.eye(4)
+    similarity[0, 1] = similarity[1, 0] = -0.99
+    similarity[0, 2] = similarity[2, 0] = 0.2
+    similarity[2, 3] = similarity[3, 2] = 0.5
+
+    mask = select_evicted_r2r(
+        scores,
+        relevance,
+        num_blocks=4,
+        budget=2,
+        warmup_pages=0,
+        candidate_expansion_factor=1.5,
+        similarity=similarity,
+        cover_depth=1,
+    )
+
+    assert int(mask.sum()) == 2
+    assert not (bool(mask[0]) and bool(mask[1]))
+
+
 def test_r2r_config_enables_query_capture_and_validates_combinations():
     cfg = GeoKVConfig.from_dict(
         {
@@ -197,6 +314,17 @@ def test_r2r_config_enables_query_capture_and_validates_combinations():
     )
     assert cfg.query_relevance_enabled
     assert cfg.candidate_expansion_factor == 2.0
+    assert cfg.r2r_cover_depth == 2
+
+    key_anchor_cfg = GeoKVConfig.from_dict(
+        {
+            "experiment_mode": "geo_uniform",
+            "prefill_evict_frac": 0.5,
+            "candidate_expansion_factor": 2.0,
+            "r2r_relevance_signal": "key_anchor",
+        }
+    )
+    assert key_anchor_cfg.r2r_relevance_signal == "key_anchor"
 
     for factor in (0.5, float("nan"), float("inf")):
         with pytest.raises(ValueError, match="candidate_expansion_factor"):
@@ -231,6 +359,29 @@ def test_r2r_config_enables_query_capture_and_validates_combinations():
                 "candidate_expansion_factor": 2.0,
             }
         )
+    with pytest.raises(ValueError, match="r2r_relevance_signal"):
+        GeoKVConfig.from_dict({"r2r_relevance_signal": "key_anchor"})
+    with pytest.raises(ValueError, match="r2r_relevance_signal"):
+        GeoKVConfig.from_dict(
+            {
+                "experiment_mode": "geo_uniform",
+                "prefill_evict_frac": 0.5,
+                "candidate_expansion_factor": 2.0,
+                "r2r_relevance_signal": "unknown",
+            }
+        )
+    for depth in (-1, 1.5, True):
+        with pytest.raises(ValueError, match="r2r_cover_depth"):
+            GeoKVConfig.from_dict(
+                {
+                    "experiment_mode": "geo_uniform",
+                    "prefill_evict_frac": 0.5,
+                    "candidate_expansion_factor": 2.0,
+                    "r2r_cover_depth": depth,
+                }
+            )
+    with pytest.raises(ValueError, match="r2r_cover_depth"):
+        GeoKVConfig.from_dict({"r2r_cover_depth": 0})
 
 
 def test_query_relevance_config_is_opt_in_and_validated():
