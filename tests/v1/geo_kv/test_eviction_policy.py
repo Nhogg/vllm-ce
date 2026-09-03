@@ -305,8 +305,19 @@ def test_r2r_second_cover_allows_eviction_on_later_pass():
 
     assert int(depth_one.sum()) == 3
     assert int(depth_two.sum()) == 3
-    assert depth_one_stats == {"cover_1": 1, "backfill": 2}
-    assert depth_two_stats == {"cover_1": 1, "cover_2": 1, "backfill": 1}
+    assert depth_one_stats == {
+        "candidate_blocks": 3,
+        "eligible_blocks": 4,
+        "cover_1": 1,
+        "backfill": 2,
+    }
+    assert depth_two_stats == {
+        "candidate_blocks": 3,
+        "eligible_blocks": 4,
+        "cover_1": 1,
+        "cover_2": 1,
+        "backfill": 1,
+    }
 
 
 def test_r2r_cover_ranking_treats_anti_alignment_as_coverage():

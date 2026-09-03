@@ -452,6 +452,9 @@ def select_evicted_r2r(
     ranks the same projection-residual pair costs used by Stage 1.
     Sink, final-anchor, and clamped tail protections match
     :func:`select_evicted_to_budget`.
+
+    When ``selection_stats`` is provided, it also receives the candidate and
+    eligible block counts needed to report candidate-pool coverage.
     """
     if scores.shape != (num_blocks,) or query_relevance.shape != (num_blocks,):
         raise ValueError("R2R scores and query relevance must match num_blocks")
@@ -485,6 +488,9 @@ def select_evicted_r2r(
         max(int(round(candidate_expansion_factor * k)), k),
         window_size,
     )
+    if selection_stats is not None:
+        selection_stats["candidate_blocks"] = candidate_count
+        selection_stats["eligible_blocks"] = window_size
 
     residual_cost = scores.detach()[lo:hi].to(torch.float32)
     candidate_order = torch.argsort(residual_cost, descending=False, stable=True)
@@ -792,6 +798,9 @@ class EvictionPolicy:
         self._query_relevance: torch.Tensor | None = None
         self._num_requests_evicted = 0
         self._r2r_selection_counts: dict[str, int] = {}
+        self._r2r_candidate_blocks = 0
+        self._r2r_eligible_blocks = 0
+        self._r2r_selection_fires = 0
         # Decode-time eviction counters/throttle (mask-only).
         self._decode_step = 0
         self._num_decode_evictions = 0
@@ -1350,6 +1359,8 @@ class EvictionPolicy:
         count: int,
         budget: int,
         value_norm: torch.Tensor | None,
+        *,
+        record_r2r_stats: bool = True,
     ) -> torch.Tensor:
         """Dispatch a budget cut to pairwise ranking or global coverage."""
         cfg = self.config
@@ -1370,10 +1381,17 @@ class EvictionPolicy:
                 cover_depth=cfg.r2r_cover_depth,
                 selection_stats=fire_stats,
             )
-            for key, value in fire_stats.items():
-                self._r2r_selection_counts[key] = (
-                    self._r2r_selection_counts.get(key, 0) + value
-                )
+            if record_r2r_stats:
+                candidate_blocks = fire_stats.pop("candidate_blocks", 0)
+                eligible_blocks = fire_stats.pop("eligible_blocks", 0)
+                if eligible_blocks:
+                    self._r2r_candidate_blocks += candidate_blocks
+                    self._r2r_eligible_blocks += eligible_blocks
+                    self._r2r_selection_fires += 1
+                    for key, value in fire_stats.items():
+                        self._r2r_selection_counts[key] = (
+                            self._r2r_selection_counts.get(key, 0) + value
+                        )
             return mask
         if cfg.redundancy_mode == "coverage":
             similarity = self._coverage_similarity
@@ -1481,15 +1499,24 @@ class EvictionPolicy:
             if scores is None:
                 return []
 
+            record_r2r_stats = True
+
             def _select_to_budget(
                 s: torch.Tensor, vn: torch.Tensor | None
             ) -> torch.Tensor:
-                return self._select_budget_mask(s, count, keep, vn)
+                return self._select_budget_mask(
+                    s,
+                    count,
+                    keep,
+                    vn,
+                    record_r2r_stats=record_r2r_stats,
+                )
 
             with self.profiler.section("selection"):
                 mask = _select_to_budget(scores, vnorm)
             self._reset_r2r_query_window(req_index, mask)
             if self.layer_calibrator.enabled:
+                record_r2r_stats = False
                 self._calibrate_layers(mask, _select_to_budget)
             with self.profiler.section("transfer"):
                 self.evicted_store[req_index, : scores.shape[0]].copy_(
@@ -1519,8 +1546,16 @@ class EvictionPolicy:
             if count < capacity:
                 return []
 
+            record_r2r_stats = True
+
             def _select(s: torch.Tensor, vn: torch.Tensor | None) -> torch.Tensor:
-                return self._select_budget_mask(s, count, low, vn)
+                return self._select_budget_mask(
+                    s,
+                    count,
+                    low,
+                    vn,
+                    record_r2r_stats=record_r2r_stats,
+                )
         else:
 
             def _select(s: torch.Tensor, vn: torch.Tensor | None) -> torch.Tensor:
@@ -1530,6 +1565,8 @@ class EvictionPolicy:
             mask = _select(scores, vnorm)
         self._reset_r2r_query_window(req_index, mask)
         if self.layer_calibrator.enabled:
+            if cfg.decode_evict_budget is not None:
+                record_r2r_stats = False
             self._calibrate_layers(mask, _select)
         self.evicted_store[req_index, :count].copy_(mask.to(self.evicted_store.device))
         if not cfg.physical_reclaim:
@@ -1751,11 +1788,22 @@ class EvictionPolicy:
         return []
 
     def close(self) -> None:
+        candidate_coverage = (
+            self._r2r_candidate_blocks / self._r2r_eligible_blocks
+            if self._r2r_eligible_blocks
+            else 0.0
+        )
         logger.info(
             "[geo_kv] EvictionPolicy closed: evicted %d requests "
-            "(prefill), %d decode-eviction events, R2R reasons=%s",
+            "(prefill), %d decode-eviction events, R2R n=%s, fires=%d, "
+            "candidate coverage=%d/%d (%.4f), reasons=%s",
             self._num_requests_evicted,
             self._num_decode_evictions,
+            self.config.candidate_expansion_factor,
+            self._r2r_selection_fires,
+            self._r2r_candidate_blocks,
+            self._r2r_eligible_blocks,
+            candidate_coverage,
             self._r2r_selection_counts,
         )
         # Flush the Phase-1B scorer profile (no-op unless enable_tracing).
