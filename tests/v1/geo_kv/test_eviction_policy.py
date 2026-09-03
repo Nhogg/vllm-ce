@@ -33,6 +33,7 @@ from vllm.v1.geo_kv.scoring import (
     block_query_attention_mass,
     block_value_l2,
     positional_cosh_weights,
+    query_direction_coherence,
     refine_with_query_relevance,
     zscore,
 )
@@ -44,6 +45,18 @@ def test_select_rate_zero_is_all_false():
     mask = select_evicted_blocks(scores, 8, 0.0, "v_redundancy", 0, 0)
     assert mask.dtype == torch.bool
     assert not bool(mask.any())
+
+
+def test_query_direction_coherence_detects_rotation_per_head():
+    stable = torch.tensor([[[1.0, 0.0]], [[2.0, 0.0]]])
+    cancelling = torch.tensor([[[1.0, 0.0]], [[-1.0, 0.0]]])
+
+    torch.testing.assert_close(
+        query_direction_coherence(stable), torch.tensor(1.0)
+    )
+    torch.testing.assert_close(
+        query_direction_coherence(cancelling), torch.tensor(0.0)
+    )
 
 
 def test_runtime_index_resolution_rejects_wrong_architecture_subset():

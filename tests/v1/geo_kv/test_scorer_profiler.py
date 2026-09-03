@@ -9,6 +9,8 @@ summary carries median/p95/total, and a JSON report round-trips to disk.
 
 import json
 
+import pytest
+
 from vllm.v1.geo_kv.scorer_profiler import PHASES, ScorerProfiler
 
 
@@ -95,6 +97,22 @@ def test_query_window_summary():
         prof.record_query_window(size)
     summary = prof.summary()["queries_per_fire"]
     assert summary == {"median": 16.0, "p95": 32.0, "min": 7.0, "max": 32.0}
+
+
+def test_query_direction_coherence_summary():
+    prof = ScorerProfiler(enabled=True)
+    prof.record_fire(8, 2)
+    for value in (0.25, 1.0, 0.5):
+        prof.record_query_direction_coherence(value)
+    summary = prof.summary()["query_direction_coherence"]
+    assert summary == {
+        "count": 3,
+        "mean": pytest.approx(7 / 12),
+        "median": 0.5,
+        "p95": 1.0,
+        "min": 0.25,
+        "max": 1.0,
+    }
 
 
 def test_incremental_update_summary():

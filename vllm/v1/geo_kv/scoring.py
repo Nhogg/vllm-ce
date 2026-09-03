@@ -18,6 +18,32 @@ from __future__ import annotations
 import torch
 
 
+def query_direction_coherence(queries: torch.Tensor) -> torch.Tensor:
+    """Measure directional stability across a per-head query window.
+
+    Computes ``norm(mean(q)) / mean(norm(q))`` independently per query head,
+    then averages heads. Values near one indicate stable directions; values
+    near zero indicate cancellation that can flatten mean relevance.
+
+    Args:
+        queries: Query window shaped ``(W, Hq, D)``.
+
+    Returns:
+        Scalar float32 tensor in ``[0, 1]``.
+    """
+    if queries.ndim != 3 or queries.shape[0] < 1:
+        raise ValueError("queries must be non-empty and shaped (W,Hq,D)")
+    q = queries.to(torch.float32)
+    numerator = torch.linalg.vector_norm(q.mean(dim=0), dim=-1)
+    denominator = torch.linalg.vector_norm(q, dim=-1).mean(dim=0)
+    per_head = torch.where(
+        denominator > 0,
+        numerator / denominator.clamp_min(torch.finfo(q.dtype).tiny),
+        torch.zeros_like(denominator),
+    )
+    return per_head.mean().clamp_(0.0, 1.0)
+
+
 def compute_prefill_head_scores(
     k_blocks: torch.Tensor, valid_lens: torch.Tensor
 ) -> dict[str, object] | None:

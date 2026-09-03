@@ -91,6 +91,8 @@ class ScorerProfiler:
         self._fires: list[tuple[int, int]] = []
         # One observed prompt/decode query-window length per scoring fire.
         self._query_windows: list[int] = []
+        # One direction-coherence value per sampled R2R layer and scoring fire.
+        self._query_direction_coherence: list[float] = []
         # One (total rows, recomputed rows) sample per incremental layer update.
         self._incremental_updates: list[tuple[int, int]] = []
         # Per-fire scorer-only detail. Selection/transfer happen after
@@ -169,6 +171,12 @@ class ScorerProfiler:
             return
         self._query_windows.append(int(num_queries))
 
+    def record_query_direction_coherence(self, value: float) -> None:
+        """Record query-direction stability for one sampled R2R layer."""
+        if not self.enabled:
+            return
+        self._query_direction_coherence.append(float(value))
+
     def record_incremental_update(
         self, total_blocks: int, recomputed_blocks: int
     ) -> None:
@@ -213,6 +221,16 @@ class ScorerProfiler:
                 "p95": _percentile(windows, 95),
                 "min": windows[0],
                 "max": windows[-1],
+            }
+        if self._query_direction_coherence:
+            values = sorted(self._query_direction_coherence)
+            out["query_direction_coherence"] = {
+                "count": len(values),
+                "mean": sum(values) / len(values),
+                "median": _percentile(values, 50),
+                "p95": _percentile(values, 95),
+                "min": values[0],
+                "max": values[-1],
             }
         if self._incremental_updates:
             totals = [total for total, _ in self._incremental_updates]

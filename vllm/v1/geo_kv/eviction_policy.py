@@ -55,6 +55,7 @@ from vllm.v1.geo_kv.scoring import (
     block_valid_lens,
     block_value_l2,
     positional_cosh_weights,
+    query_direction_coherence,
     refine_with_query_relevance,
     zscore,
 )
@@ -1109,6 +1110,9 @@ class EvictionPolicy:
                 assert k is not None
                 query_window_len = int(queries.shape[0])
                 with prof.section("query_attention"):
+                    if r2r_mode and prof.enabled:
+                        coherence = query_direction_coherence(queries)
+                        prof.record_query_direction_coherence(coherence.item())
                     relevance_fn = (
                         block_key_anchor_relevance
                         if cfg.r2r_relevance_signal == "key_anchor"
