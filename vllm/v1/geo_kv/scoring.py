@@ -44,6 +44,52 @@ def query_direction_coherence(queries: torch.Tensor) -> torch.Tensor:
     return per_head.mean().clamp_(0.0, 1.0)
 
 
+def value_set_logdet(
+    values: torch.Tensor, retained_mask: torch.Tensor | None = None
+) -> torch.Tensor:
+    """Compute CapKV's retained-value log-determinant metric per head.
+
+    Evaluates ``log det(I + sum_t v_t v_t.T)`` and uses Sylvester's
+    determinant identity to build the smaller of the token Gram matrix and
+    head-dimension covariance matrix. All heads are evaluated in one batch.
+
+    Args:
+        values: Value vectors shaped ``(N, H, D)``.
+        retained_mask: Optional boolean mask shaped ``(N,)`` selecting the
+            retained value set.
+
+    Returns:
+        ``(H,)`` float32 log-determinants, one per KV head.
+
+    Raises:
+        ValueError: If the value tensor or retained mask has an invalid shape.
+    """
+    if values.ndim != 3:
+        raise ValueError("values must be shaped (N,H,D)")
+    token_count, num_heads, head_dim = values.shape
+    if retained_mask is not None:
+        if (
+            retained_mask.shape != (token_count,)
+            or retained_mask.dtype != torch.bool
+        ):
+            raise ValueError("retained_mask must be bool and shaped (N,)")
+        values = values[retained_mask.to(device=values.device)]
+        token_count = values.shape[0]
+    if token_count == 0:
+        return torch.zeros(num_heads, dtype=torch.float32, device=values.device)
+
+    vectors = values.to(torch.float32).transpose(0, 1)  # (H, N, D)
+    if token_count <= head_dim:
+        matrix = vectors @ vectors.transpose(1, 2)
+    else:
+        matrix = vectors.transpose(1, 2) @ vectors
+    matrix.diagonal(dim1=-2, dim2=-1).add_(1.0)
+    sign, logabsdet = torch.linalg.slogdet(matrix)
+    return torch.where(
+        sign > 0, logabsdet, torch.full_like(logabsdet, float("nan"))
+    )
+
+
 def compute_prefill_head_scores(
     k_blocks: torch.Tensor, valid_lens: torch.Tensor
 ) -> dict[str, object] | None:

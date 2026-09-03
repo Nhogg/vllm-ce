@@ -35,6 +35,7 @@ from vllm.v1.geo_kv.scoring import (
     positional_cosh_weights,
     query_direction_coherence,
     refine_with_query_relevance,
+    value_set_logdet,
     zscore,
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec
@@ -57,6 +58,38 @@ def test_query_direction_coherence_detects_rotation_per_head():
     torch.testing.assert_close(
         query_direction_coherence(cancelling), torch.tensor(0.0)
     )
+
+
+def test_value_set_logdet_matches_orthogonal_analytic_result():
+    values = torch.tensor(
+        [
+            [[1.0, 0.0], [2.0, 0.0]],
+            [[0.0, 1.0], [0.0, 3.0]],
+        ]
+    )
+
+    actual = value_set_logdet(values)
+    expected = torch.log(torch.tensor([4.0, 50.0]))
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_value_set_logdet_uses_retained_mask_and_empty_identity():
+    values = torch.tensor(
+        [
+            [[1.0, 0.0]],
+            [[1.0, 0.0]],
+            [[0.0, 2.0]],
+        ]
+    )
+
+    retained = value_set_logdet(values, torch.tensor([True, True, False]))
+    full = value_set_logdet(values)
+    empty = value_set_logdet(values, torch.zeros(3, dtype=torch.bool))
+
+    torch.testing.assert_close(retained, torch.log(torch.tensor([3.0])))
+    torch.testing.assert_close(full, torch.log(torch.tensor([15.0])))
+    torch.testing.assert_close(empty, torch.zeros(1))
 
 
 def test_runtime_index_resolution_rejects_wrong_architecture_subset():
