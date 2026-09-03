@@ -573,6 +573,7 @@ def block_query_attention_mass(
     k_blocks: torch.Tensor,
     valid_lens: torch.Tensor,
     scale: float | None = None,
+    query_aggregation: str = "mean",
 ) -> torch.Tensor:
     """Exact causal QK attention mass assigned to each whole KV block.
 
@@ -588,12 +589,16 @@ def block_query_attention_mass(
         k_blocks: Post-RoPE keys shaped ``(B, S, Hkv, D)``.
         valid_lens: Valid token count per block, shaped ``(B,)``.
         scale: Attention logit scale. Defaults to ``D**-0.5``.
+        query_aggregation: Reduce per-query block mass with ``mean`` or ``max``.
 
     Returns:
-        ``(B,)`` non-negative mass summing to approximately one.
+        ``(B,)`` non-negative block mass. Mean aggregation sums to
+        approximately one; peak aggregation need not.
     """
     if queries.ndim != 3 or k_blocks.ndim != 4:
         raise ValueError("queries must be (W,Hq,D) and k_blocks (B,S,Hkv,D)")
+    if query_aggregation not in ("mean", "max"):
+        raise ValueError("query_aggregation must be 'mean' or 'max'")
     W, Hq, D = queries.shape
     B, S, Hkv, key_dim = k_blocks.shape
     if W < 1 or B < 1 or key_dim != D or Hq % Hkv != 0:
@@ -611,7 +616,7 @@ def block_query_attention_mass(
     token_valid = token_pos < valid_lens.view(B, 1)
     # The captured queries are the last W valid tokens of this request in the
     # current storage order. The runner reconstructs this tail across scheduler
-    # chunks and request-slot reassignment; decode naturally supplies W=1.
+    # chunks and request-slot reassignment.
     # Keep this scalar on device. ``int(valid_lens.sum())`` would introduce one
     # GPU-to-host synchronization per sampled layer in the production scorer.
     total_valid = valid_lens.sum()
@@ -626,7 +631,12 @@ def block_query_attention_mass(
         ~causal_valid.view(W, 1, 1, B, S), float("-inf")
     )
     probs = torch.softmax(logits.flatten(-2), dim=-1).view(W, Hkv, Hq // Hkv, B, S)
-    mass = probs.sum(dim=(0, 1, 2, 4)) / float(W * Hq)
+    per_query_mass = probs.sum(dim=(1, 2, 4)) / float(Hq)
+    mass = (
+        per_query_mass.mean(dim=0)
+        if query_aggregation == "mean"
+        else per_query_mass.amax(dim=0)
+    )
     return mass.to(torch.float32)
 
 
@@ -635,6 +645,7 @@ def block_key_anchor_relevance(
     k_blocks: torch.Tensor,
     valid_lens: torch.Tensor,
     scale: float | None = None,
+    query_aggregation: str = "max",
 ) -> torch.Tensor:
     """Score whole blocks by query dot mean-pooled post-RoPE keys.
 
@@ -643,10 +654,11 @@ def block_key_anchor_relevance(
         k_blocks: Post-RoPE keys shaped ``(B, S, Hkv, D)``.
         valid_lens: Valid token count per block, shaped ``(B,)``.
         scale: Query-key scale. Defaults to ``D**-0.5``.
+        query_aggregation: Reduce query-token relevance with ``max`` or ``mean``.
 
     Returns:
-        ``(B,)`` peak query-to-key-anchor relevance over query tokens and heads.
-        The max is the conservative whole-block reduction required by vLLM's
+        ``(B,)`` query-to-key-anchor relevance. Query tokens use the requested
+        aggregation; query heads use the conservative max required by vLLM's
         shared physical block after computing per-head dot products.
 
     Raises:
@@ -654,6 +666,8 @@ def block_key_anchor_relevance(
     """
     if queries.ndim != 3 or k_blocks.ndim != 4:
         raise ValueError("queries must be (W,Hq,D) and k_blocks (B,S,Hkv,D)")
+    if query_aggregation not in ("max", "mean"):
+        raise ValueError("query_aggregation must be 'max' or 'mean'")
     W, Hq, D = queries.shape
     B, _, Hkv, key_dim = k_blocks.shape
     if W < 1 or B < 1 or key_dim != D or Hq % Hkv != 0:
@@ -662,7 +676,14 @@ def block_key_anchor_relevance(
         )
     anchors = block_anchors(k_blocks, valid_lens)
     q = queries.to(torch.float32).reshape(W, Hkv, Hq // Hkv, D)
-    relevance = torch.einsum("whgd,bhd->whgb", q, anchors).amax(dim=(0, 1, 2))
+    if query_aggregation == "mean":
+        relevance = torch.einsum(
+            "hgd,bhd->hgb", q.mean(dim=0), anchors
+        ).amax(dim=(0, 1))
+    else:
+        relevance = torch.einsum("whgd,bhd->whgb", q, anchors).amax(
+            dim=(0, 1, 2)
+        )
     relevance.mul_(float(scale) if scale is not None else D**-0.5)
     return relevance.to(torch.float32)
 

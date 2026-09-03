@@ -1120,6 +1120,9 @@ class EvictionPolicy:
                             k,
                             valid,
                             self.query_capturer.scale(layer_idx),
+                            query_aggregation=(
+                                cfg.r2r_query_aggregation if r2r_mode else "mean"
+                            ),
                         )
                     )
             with prof.section("similarity"):

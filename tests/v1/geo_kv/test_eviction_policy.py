@@ -70,6 +70,22 @@ def test_block_query_attention_mass_is_causal_and_gqa_aware():
     assert mass[0] > mass[1]
 
 
+def test_block_query_attention_mass_supports_peak_window_aggregation():
+    queries = torch.tensor([[[8.0, 0.0]], [[0.0, 8.0]]])
+    keys = torch.tensor([[[[1.0, 0.0]]], [[[0.0, 1.0]]]])
+    valid = torch.tensor([1, 1])
+
+    mean = block_query_attention_mass(
+        queries, keys, valid, scale=1.0, query_aggregation="mean"
+    )
+    peak = block_query_attention_mass(
+        queries, keys, valid, scale=1.0, query_aggregation="max"
+    )
+
+    assert torch.all(peak >= mean)
+    assert bool(torch.any(peak > mean))
+
+
 def test_block_key_anchor_relevance_masks_partial_blocks_and_supports_gqa():
     queries = torch.tensor([[[1.0, 0.0]] * 4, [[1.0, 0.0]] * 4])
     keys = torch.zeros(2, 2, 2, 2)
@@ -93,6 +109,21 @@ def test_block_key_anchor_relevance_uses_peak_query_not_mean():
     )
 
     torch.testing.assert_close(relevance, torch.tensor([4.0, 3.0]))
+
+
+def test_block_key_anchor_relevance_mean_collapses_query_window():
+    queries = torch.tensor([[[1.0, 0.0]], [[0.0, 1.0]]])
+    keys = torch.tensor([[[[4.0, 0.0]]], [[[0.0, 2.0]]]])
+
+    relevance = block_key_anchor_relevance(
+        queries,
+        keys,
+        torch.tensor([1, 1]),
+        scale=1.0,
+        query_aggregation="mean",
+    )
+
+    torch.testing.assert_close(relevance, torch.tensor([2.0, 1.0]))
 
 
 def test_block_key_anchor_relevance_rejects_incompatible_gqa_shapes():
@@ -354,6 +385,7 @@ def test_r2r_config_enables_query_capture_and_validates_combinations():
     assert cfg.query_relevance_enabled
     assert cfg.candidate_expansion_factor == 2.0
     assert cfg.r2r_cover_depth == 2
+    assert cfg.r2r_query_aggregation == "max"
 
     key_anchor_cfg = GeoKVConfig.from_dict(
         {
@@ -364,6 +396,16 @@ def test_r2r_config_enables_query_capture_and_validates_combinations():
         }
     )
     assert key_anchor_cfg.r2r_relevance_signal == "key_anchor"
+
+    mean_cfg = GeoKVConfig.from_dict(
+        {
+            "experiment_mode": "geo_uniform",
+            "prefill_evict_frac": 0.5,
+            "candidate_expansion_factor": 2.0,
+            "r2r_query_aggregation": "mean",
+        }
+    )
+    assert mean_cfg.r2r_query_aggregation == "mean"
 
     for factor in (0.5, float("nan"), float("inf")):
         with pytest.raises(ValueError, match="candidate_expansion_factor"):
@@ -400,6 +442,17 @@ def test_r2r_config_enables_query_capture_and_validates_combinations():
         )
     with pytest.raises(ValueError, match="r2r_relevance_signal"):
         GeoKVConfig.from_dict({"r2r_relevance_signal": "key_anchor"})
+    with pytest.raises(ValueError, match="r2r_query_aggregation"):
+        GeoKVConfig.from_dict({"r2r_query_aggregation": "mean"})
+    with pytest.raises(ValueError, match="r2r_query_aggregation"):
+        GeoKVConfig.from_dict(
+            {
+                "experiment_mode": "geo_uniform",
+                "prefill_evict_frac": 0.5,
+                "candidate_expansion_factor": 2.0,
+                "r2r_query_aggregation": "median",
+            }
+        )
     with pytest.raises(ValueError, match="r2r_relevance_signal"):
         GeoKVConfig.from_dict(
             {

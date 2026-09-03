@@ -58,6 +58,7 @@ OVERFLOW_EVICTION_MODES = ("repeated_single",)
 # V1 capacity-band path for a matched-memory contrast against v_redundancy.
 EVICTION_POLICIES = ("v_redundancy", "recency", "random", "value_l2")
 R2R_RELEVANCE_SIGNALS = ("attention_mass", "key_anchor")
+R2R_QUERY_AGGREGATIONS = ("max", "mean")
 # Mirror of scoring.NORM_VARIANTS, duplicated so config stays import-light
 # (no torch). Kept in sync by the norm_variants validation test.
 NORM_VARIANT_CHOICES = ("raw", "center_request", "whiten_request")
@@ -303,6 +304,9 @@ class GeoKVConfig:
     # Stage-2 relevance signal. Exact causal attention mass is the established
     # default; key_anchor is the cheaper spec-literal Q dot MeanPool(K) ablation.
     r2r_relevance_signal: str = "attention_mass"
+    # Reduce relevance over the query window. Peak relevance is the algorithm
+    # default; mean is the cheaper ablation, especially for key anchors.
+    r2r_query_aggregation: str = "max"
     query_tail_tokens: int = 32
     # Tail-protect (recency floor) for the budget path: never V-evict the last
     # ``ceil(query_tail_protect_frac * num_blocks)`` blocks of a request. The
@@ -419,6 +423,11 @@ class GeoKVConfig:
             "r2r_relevance_signal",
             self.r2r_relevance_signal,
             R2R_RELEVANCE_SIGNALS,
+        )
+        _check_choice(
+            "r2r_query_aggregation",
+            self.r2r_query_aggregation,
+            R2R_QUERY_AGGREGATIONS,
         )
         _check_choice(
             "value_l2_block_reduction",
@@ -620,6 +629,11 @@ class GeoKVConfig:
         elif self.r2r_relevance_signal != "attention_mass":
             raise ValueError(
                 "geo_kv.r2r_relevance_signal requires "
+                "candidate_expansion_factor"
+            )
+        elif self.r2r_query_aggregation != "max":
+            raise ValueError(
+                "geo_kv.r2r_query_aggregation requires "
                 "candidate_expansion_factor"
             )
         if (
