@@ -115,6 +115,22 @@ def test_query_direction_coherence_summary():
     }
 
 
+def test_retained_value_logdet_summary():
+    prof = ScorerProfiler(enabled=True)
+    prof.record_fire(8, 2)
+    prof.record_retained_value_logdet([1.0, 3.0])
+    prof.record_retained_value_logdet([2.0])
+
+    assert prof.summary()["retained_value_logdet"] == {
+        "count": 3,
+        "mean": 2.0,
+        "median": 2.0,
+        "p95": 3.0,
+        "min": 1.0,
+        "max": 3.0,
+    }
+
+
 def test_incremental_update_summary():
     prof = ScorerProfiler(enabled=True)
     prof.record_incremental_update(total_blocks=8, recomputed_blocks=8)

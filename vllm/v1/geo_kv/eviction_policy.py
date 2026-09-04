@@ -57,6 +57,7 @@ from vllm.v1.geo_kv.scoring import (
     positional_cosh_weights,
     query_direction_coherence,
     refine_with_query_relevance,
+    value_set_logdet,
     zscore,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
@@ -793,6 +794,8 @@ class EvictionPolicy:
         # Per-fire global similarity matrix for coverage or R2R cover selection.
         self._coverage_similarity: torch.Tensor | None = None
         self._r2r_cover_cost: torch.Tensor | None = None
+        # Per-layer value rows retained only until traced R2R selection.
+        self._r2r_metric_values: list[tuple[torch.Tensor, torch.Tensor]] = []
         # Raw causal QK attention mass for hard relevance protection. It remains
         # separate from finalized scores so positional cosh can compose without
         # changing which high-relevance blocks the hard constraint protects.
@@ -985,6 +988,7 @@ class EvictionPolicy:
         cfg = self.config
         self._coverage_similarity = None
         self._r2r_cover_cost = None
+        self._r2r_metric_values.clear()
         self._query_relevance = None
         value_l2 = cfg.eviction_policy == "value_l2"
         greedy = (not value_l2) and cfg.redundancy_mode == "greedy"
@@ -1069,6 +1073,8 @@ class EvictionPolicy:
             block_count = c
             scored_layer_idxs.append(layer_idx)
             valid = block_valid_lens(valid_len, c, self.block_size, self.device)
+            if r2r_mode and prof.enabled:
+                self._r2r_metric_values.append((v, valid))
             if value_l2:
                 # Paged-Eviction baseline: drop lowest value-L2-norm blocks.
                 # Negate so higher == more droppable, matching the scored-policy
@@ -1399,6 +1405,22 @@ class EvictionPolicy:
                         self._r2r_selection_counts[key] = (
                             self._r2r_selection_counts.get(key, 0) + value
                         )
+                    if self.profiler.enabled and self._r2r_metric_values:
+                        mask_device = mask.to(self.device)
+                        token_pos = torch.arange(
+                            self.block_size, device=self.device
+                        ).view(1, self.block_size)
+                        for values, valid_lens in self._r2r_metric_values:
+                            retained = (~mask_device).view(-1, 1) & (
+                                token_pos < valid_lens.view(-1, 1)
+                            )
+                            logdet = value_set_logdet(
+                                values.flatten(0, 1), retained.flatten()
+                            )
+                            self.profiler.record_retained_value_logdet(
+                                logdet.tolist()
+                            )
+                self._r2r_metric_values.clear()
             return mask
         if cfg.redundancy_mode == "coverage":
             similarity = self._coverage_similarity

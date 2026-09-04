@@ -93,6 +93,8 @@ class ScorerProfiler:
         self._query_windows: list[int] = []
         # One direction-coherence value per sampled R2R layer and scoring fire.
         self._query_direction_coherence: list[float] = []
+        # Per-head CapKV metric values for traced R2R retained sets.
+        self._retained_value_logdet: list[float] = []
         # One (total rows, recomputed rows) sample per incremental layer update.
         self._incremental_updates: list[tuple[int, int]] = []
         # Per-fire scorer-only detail. Selection/transfer happen after
@@ -177,6 +179,12 @@ class ScorerProfiler:
             return
         self._query_direction_coherence.append(float(value))
 
+    def record_retained_value_logdet(self, values: list[float]) -> None:
+        """Record per-head retained-value log-determinants for one layer."""
+        if not self.enabled:
+            return
+        self._retained_value_logdet.extend(float(value) for value in values)
+
     def record_incremental_update(
         self, total_blocks: int, recomputed_blocks: int
     ) -> None:
@@ -225,6 +233,16 @@ class ScorerProfiler:
         if self._query_direction_coherence:
             values = sorted(self._query_direction_coherence)
             out["query_direction_coherence"] = {
+                "count": len(values),
+                "mean": sum(values) / len(values),
+                "median": _percentile(values, 50),
+                "p95": _percentile(values, 95),
+                "min": values[0],
+                "max": values[-1],
+            }
+        if self._retained_value_logdet:
+            values = sorted(self._retained_value_logdet)
+            out["retained_value_logdet"] = {
                 "count": len(values),
                 "mean": sum(values) / len(values),
                 "median": _percentile(values, 50),
