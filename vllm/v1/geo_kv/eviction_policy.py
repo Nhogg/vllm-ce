@@ -1405,6 +1405,9 @@ class EvictionPolicy:
                         self._r2r_selection_counts[key] = (
                             self._r2r_selection_counts.get(key, 0) + value
                         )
+                    self.profiler.record_r2r_selection(
+                        candidate_blocks, eligible_blocks, fire_stats
+                    )
                     if self.profiler.enabled and self._r2r_metric_values:
                         mask_device = mask.to(self.device)
                         token_pos = torch.arange(

@@ -95,6 +95,10 @@ class ScorerProfiler:
         self._query_direction_coherence: list[float] = []
         # Per-head CapKV metric values for traced R2R retained sets.
         self._retained_value_logdet: list[float] = []
+        self._r2r_candidate_blocks = 0
+        self._r2r_eligible_blocks = 0
+        self._r2r_selection_fires = 0
+        self._r2r_selection_reasons: dict[str, int] = defaultdict(int)
         # One (total rows, recomputed rows) sample per incremental layer update.
         self._incremental_updates: list[tuple[int, int]] = []
         # Per-fire scorer-only detail. Selection/transfer happen after
@@ -185,6 +189,18 @@ class ScorerProfiler:
             return
         self._retained_value_logdet.extend(float(value) for value in values)
 
+    def record_r2r_selection(
+        self, candidate_blocks: int, eligible_blocks: int, reasons: dict[str, int]
+    ) -> None:
+        """Record candidate coverage and guard outcomes for one real R2R fire."""
+        if not self.enabled or eligible_blocks <= 0:
+            return
+        self._r2r_candidate_blocks += int(candidate_blocks)
+        self._r2r_eligible_blocks += int(eligible_blocks)
+        self._r2r_selection_fires += 1
+        for key, value in reasons.items():
+            self._r2r_selection_reasons[key] += int(value)
+
     def record_incremental_update(
         self, total_blocks: int, recomputed_blocks: int
     ) -> None:
@@ -249,6 +265,16 @@ class ScorerProfiler:
                 "p95": _percentile(values, 95),
                 "min": values[0],
                 "max": values[-1],
+            }
+        if self._r2r_selection_fires:
+            out["r2r_selection"] = {
+                "fires": self._r2r_selection_fires,
+                "candidate_blocks": self._r2r_candidate_blocks,
+                "eligible_blocks": self._r2r_eligible_blocks,
+                "candidate_coverage": (
+                    self._r2r_candidate_blocks / self._r2r_eligible_blocks
+                ),
+                "reasons": dict(self._r2r_selection_reasons),
             }
         if self._incremental_updates:
             totals = [total for total, _ in self._incremental_updates]

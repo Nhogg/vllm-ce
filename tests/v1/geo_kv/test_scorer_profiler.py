@@ -131,6 +131,21 @@ def test_retained_value_logdet_summary():
     }
 
 
+def test_r2r_selection_summary():
+    prof = ScorerProfiler(enabled=True)
+    prof.record_fire(8, 2)
+    prof.record_r2r_selection(4, 8, {"cover_1": 2, "backfill": 1})
+    prof.record_r2r_selection(3, 6, {"cover_1": 1, "cover_2": 2})
+
+    assert prof.summary()["r2r_selection"] == {
+        "fires": 2,
+        "candidate_blocks": 7,
+        "eligible_blocks": 14,
+        "candidate_coverage": 0.5,
+        "reasons": {"cover_1": 3, "backfill": 1, "cover_2": 2},
+    }
+
+
 def test_incremental_update_summary():
     prof = ScorerProfiler(enabled=True)
     prof.record_incremental_update(total_blocks=8, recomputed_blocks=8)
