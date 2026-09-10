@@ -191,7 +191,7 @@ def _geo_config(args) -> dict[str, Any] | None:
     gk: dict[str, Any] = {
         "experiment_mode": "geo_uniform",
         "eviction_policy": args.eviction_policy,
-        "score_sampled_layers": "all",
+        "score_sampled_layers": args.score_sampled_layers,
         "block_score_aggregation": "mean",
         "warmup_pages": args.warmup_pages,
         "decode_evict_watermark": args.watermark,
@@ -462,6 +462,8 @@ def _spawn(
         str(args.interval),
         "--warmup-pages",
         str(args.warmup_pages),
+        "--score-sampled-layers",
+        args.score_sampled_layers,
         "--eviction-policy",
         args.eviction_policy,
         *(
@@ -880,6 +882,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--interval", type=int, default=1, help="decode_evict_interval (step throttle)."
     )
     p.add_argument("--warmup-pages", type=int, default=1)
+    p.add_argument(
+        "--score-sampled-layers",
+        default="3,10,17,24",
+        help="Layers used for GeoKV scoring and query capture (at most eight).",
+    )
     p.add_argument(
         "--eviction-policy",
         choices=("v_redundancy", "recency", "random", "value_l2"),
