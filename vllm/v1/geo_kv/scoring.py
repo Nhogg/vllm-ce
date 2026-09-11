@@ -640,6 +640,43 @@ def block_value_l2(
     raise ValueError(f"unknown value-L2 block reduction: {reduction!r}")
 
 
+def block_paged_eviction_score(
+    k_blocks: torch.Tensor,
+    v_blocks: torch.Tensor,
+    valid_lens: torch.Tensor,
+) -> torch.Tensor:
+    """Compute the published PagedEviction importance score per block.
+
+    Each token/head cell is scored as ``||V||_2 / ||K||_2``. Scores are
+    averaged over KV heads and then over valid tokens in the block, matching
+    the paper's value-to-key norm ratio and mean page aggregation. Lower scores
+    are less important and are therefore evicted first.
+
+    Args:
+        k_blocks: K vectors shaped ``(B, block_size, H, D)``.
+        v_blocks: V vectors with the same shape as ``k_blocks``.
+        valid_lens: ``(B,)`` valid-token counts for each block.
+
+    Returns:
+        ``(B,)`` float32 block-importance scores (not negated).
+
+    Raises:
+        ValueError: If K and V shapes differ.
+    """
+    if k_blocks.shape != v_blocks.shape:
+        raise ValueError("k_blocks and v_blocks must have identical shapes")
+    B, S, _, _ = v_blocks.shape
+    device = v_blocks.device
+    k_norm = torch.linalg.vector_norm(k_blocks.to(torch.float32), dim=-1)
+    v_norm = torch.linalg.vector_norm(v_blocks.to(torch.float32), dim=-1)
+    ratio = v_norm / k_norm.clamp_min(torch.finfo(torch.float32).eps)
+    per_token = ratio.mean(dim=2)
+    positions = torch.arange(S, device=device).view(1, S)
+    valid = positions < valid_lens.view(B, 1)
+    summed = per_token.masked_fill(~valid, 0.0).sum(dim=1)
+    return summed / valid_lens.clamp_min(1).to(torch.float32)
+
+
 def block_query_attention_mass(
     queries: torch.Tensor,
     k_blocks: torch.Tensor,

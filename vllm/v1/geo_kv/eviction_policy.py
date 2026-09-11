@@ -49,6 +49,7 @@ from vllm.v1.geo_kv.scoring import (
     block_joint_similarity,
     block_key_anchor_relevance,
     block_multi_prototype_redundancy,
+    block_paged_eviction_score,
     block_pair_residual_cost,
     block_prototypes,
     block_query_attention_mass,
@@ -116,7 +117,7 @@ def _choose_evicted(
     Returns:
         ``(k,)`` long tensor: the chosen block indices.
     """
-    if policy in ("v_redundancy", "value_l2"):
+    if policy in ("v_redundancy", "value_l2", "paged_eviction"):
         # Both are scored policies: highest droppability first. v_redundancy
         # scores by V-redundancy; value_l2 passes a negated value-L2 norm (so
         # lowest-norm == highest droppability), computed in _score_request_blocks.
@@ -991,16 +992,20 @@ class EvictionPolicy:
         self._r2r_metric_values.clear()
         self._query_relevance = None
         value_l2 = cfg.eviction_policy == "value_l2"
-        greedy = (not value_l2) and cfg.redundancy_mode == "greedy"
-        coverage_mode = (not value_l2) and cfg.redundancy_mode == "coverage"
-        r2r_mode = (not value_l2) and cfg.candidate_expansion_factor is not None
-        blend_beta = None if value_l2 else cfg.value_blend_beta
+        paged_eviction = cfg.eviction_policy == "paged_eviction"
+        baseline_score = value_l2 or paged_eviction
+        greedy = (not baseline_score) and cfg.redundancy_mode == "greedy"
+        coverage_mode = (not baseline_score) and cfg.redundancy_mode == "coverage"
+        r2r_mode = (
+            not baseline_score and cfg.candidate_expansion_factor is not None
+        )
+        blend_beta = None if baseline_score else cfg.value_blend_beta
         # Phase 2 norm protection also needs the per-block value-L2 norm; compute
         # it whenever either consumer is active (both only apply to v_redundancy).
-        want_vnorm = (not value_l2) and (
+        want_vnorm = (not baseline_score) and (
             bool(blend_beta) or cfg.value_norm_protect_quantile is not None
         )
-        want_query = (not value_l2) and cfg.query_relevance_enabled
+        want_query = (not baseline_score) and cfg.query_relevance_enabled
         warmup = int(cfg.warmup_pages or 0)
         per_layer: list[torch.Tensor] = []
         per_layer_vnorm: list[torch.Tensor] = []  # populated when want_vnorm
@@ -1064,9 +1069,10 @@ class EvictionPolicy:
                     if want_query and self.query_capturer is not None
                     else None
                 )
+                need_keys = queries is not None or paged_eviction
                 k = (
                     self.kv[layer_name][block_ids, 0]
-                    if queries is not None and block_ids is not None
+                    if need_keys and block_ids is not None
                     else None
                 )
             num_scored_layers += 1
@@ -1083,6 +1089,13 @@ class EvictionPolicy:
                     per_layer.append(
                         -block_value_l2(v, valid, cfg.value_l2_block_reduction)
                     )
+                continue
+            if paged_eviction:
+                assert k is not None
+                # The selector consumes droppability (higher is evicted first),
+                # so negate the paper's importance score.
+                with prof.section("anchor_norm"):
+                    per_layer.append(-block_paged_eviction_score(k, v, valid))
                 continue
             with prof.section("anchor_norm"):
                 if cfg.block_prototype_mode == "mean":
@@ -1246,7 +1259,7 @@ class EvictionPolicy:
             )
             self._cal_row_layer_idxs = list(scored_layer_idxs)
         scores = self._finalize_scores(
-            scores, vnorm, value_l2, query_relevance=query_relevance
+            scores, vnorm, baseline_score, query_relevance=query_relevance
         )
         return scores, vnorm
 

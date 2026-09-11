@@ -180,8 +180,8 @@ def _geo_config(args) -> dict[str, Any] | None:
 
     Maps the ablation regime + swept knob onto the decoupled per-end knobs. Every
     regime uses physical reclaim; ``eviction_policy`` selects WHICH blocks the
-    band drops (``v_redundancy`` is the thesis; ``recency``/``random``/``value_l2``
-    are the matched-memory baselines). The two drip regimes use
+    band drops (``v_redundancy`` is the thesis; ``recency``/``random``/``value_l2``/
+    ``paged_eviction`` are matched-memory baselines). The two drip regimes use
     ``decode_evict_blocks_per_step`` (a fixed-rate decode drain) instead of the
     watermark band.
     """
@@ -889,11 +889,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--eviction-policy",
-        choices=("v_redundancy", "recency", "random", "value_l2"),
+        choices=(
+            "v_redundancy",
+            "recency",
+            "random",
+            "value_l2",
+            "paged_eviction",
+        ),
         default="v_redundancy",
         help="Which blocks the band drops: v_redundancy (scored, the thesis) or "
         "the matched-memory baselines recency (oldest-first == StreamingLLM), "
-        "random (seeded), value_l2 (Paged-Eviction). All drop the same COUNT, so "
+        "random (seeded), value_l2 (reference-code score), or paged_eviction "
+        "(published V/K ratio). All drop the same COUNT, so "
         "the accuracy contrast is at matched retained memory.",
     )
     p.add_argument(

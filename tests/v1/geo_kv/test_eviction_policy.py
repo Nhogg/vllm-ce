@@ -28,6 +28,7 @@ from vllm.v1.geo_kv.scoring import (
     block_joint_similarity,
     block_key_anchor_relevance,
     block_multi_prototype_redundancy,
+    block_paged_eviction_score,
     block_pair_residual_cost,
     block_prototypes,
     block_query_attention_mass,
@@ -933,7 +934,9 @@ def test_config_capacity_band_allows_recency_policy():
     assert cfg.decode_evict_budget == 64
 
 
-@pytest.mark.parametrize("policy", ["recency", "random", "value_l2"])
+@pytest.mark.parametrize(
+    "policy", ["recency", "random", "value_l2", "paged_eviction"]
+)
 @pytest.mark.parametrize("knob", ["decode_evict_frac", "prefill_evict_frac"])
 def test_config_frac_band_allows_baseline_policies(policy, knob):
     # The fraction-of-prompt path (Stage D) must honor the matched-memory
@@ -1050,6 +1053,31 @@ def test_block_value_l2_masks_partial_final_block():
     assert torch.allclose(score, torch.tensor([1.0, 4.0, 3.0]))
 
 
+def test_paged_eviction_score_is_mean_token_value_key_norm_ratio():
+    B, S, H, D = 2, 3, 2, 2
+    k = torch.zeros(B, S, H, D)
+    v = torch.zeros_like(k)
+    # Ratios per token/head. Block 0 valid ratios average to
+    # mean([mean(2, 4), mean(6, 8)]) = 5. Block 1 has one valid token with
+    # mean(1, 3) = 2; its padded tokens must not contribute.
+    ratios = torch.tensor(
+        [[[2.0, 4.0], [6.0, 8.0], [100.0, 100.0]],
+         [[1.0, 3.0], [100.0, 100.0], [100.0, 100.0]]]
+    )
+    k[..., 0] = 2.0
+    v[..., 0] = ratios * 2.0
+    valid = torch.tensor([2, 1])
+    score = block_paged_eviction_score(k, v, valid)
+    assert torch.allclose(score, torch.tensor([5.0, 2.0]))
+
+
+def test_paged_eviction_score_clamps_zero_key_norm():
+    k = torch.zeros(1, 1, 1, 2)
+    v = torch.zeros_like(k)
+    score = block_paged_eviction_score(k, v, torch.tensor([1]))
+    assert torch.equal(score, torch.zeros(1))
+
+
 def test_block_value_l2_rare_signal_reductions_mask_padding():
     v = torch.zeros(2, 3, 2, 2)
     # Block 0 has a rare strong token in one head; block 1 has distributed
@@ -1116,6 +1144,18 @@ def test_budget_value_l2_drops_lowest_norm_blocks_and_protects_ends():
     assert [i for i in range(B) if bool(mask[i])] == [2, 4]
     assert not bool(mask[0])  # sink kept
     assert not bool(mask[B - 1])  # anchor kept
+
+
+def test_budget_paged_eviction_drops_lowest_ratio_blocks():
+    scores = -torch.tensor([9.0, 0.9, 0.1, 0.8, 0.2, 9.0])
+    mask = select_evicted_to_budget(
+        scores,
+        num_blocks=6,
+        budget=4,
+        warmup_pages=1,
+        policy="paged_eviction",
+    )
+    assert [i for i in range(6) if bool(mask[i])] == [2, 4]
 
 
 def test_tail_protect_shields_last_blocks_and_stays_matched():

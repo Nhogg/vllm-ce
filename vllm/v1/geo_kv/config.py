@@ -53,10 +53,16 @@ BLOCK_PROTOTYPE_MODES = ("mean", "quarters", "mean_top2_norm")
 VALUE_L2_BLOCK_REDUCTIONS = ("sum", "max_token", "max_token_head")
 OVERFLOW_EVICTION_MODES = ("repeated_single",)
 # Milestone-1 (mask-only) eviction policies. v_redundancy is the thesis;
-# recency (drop-oldest) and random are the matched-count baselines; value_l2 is
-# the Paged-Eviction baseline (drop lowest value-L2-norm blocks), ported into the
-# V1 capacity-band path for a matched-memory contrast against v_redundancy.
-EVICTION_POLICIES = ("v_redundancy", "recency", "random", "value_l2")
+# recency and random are matched-count baselines. value_l2 reproduces the
+# reference repository's live score; paged_eviction implements the published
+# value-to-key norm ratio with mean page aggregation.
+EVICTION_POLICIES = (
+    "v_redundancy",
+    "recency",
+    "random",
+    "value_l2",
+    "paged_eviction",
+)
 R2R_RELEVANCE_SIGNALS = ("attention_mass", "key_anchor")
 R2R_QUERY_AGGREGATIONS = ("max", "mean")
 # Mirror of scoring.NORM_VARIANTS, duplicated so config stays import-light
@@ -479,9 +485,9 @@ class GeoKVConfig:
                 )
         # Decoupled fraction-of-prompt targets. Each is independent; when either
         # is set it uses the same policy/mode requirements as the budget path.
-        # eviction_policy selects WHICH blocks the band drops: v_redundancy
-        # (scored, the thesis), recency (oldest-first == StreamingLLM baseline at
-        # matched memory), random, or value_l2 (the Paged-Eviction contrast). All
+        # eviction_policy selects WHICH blocks the band drops: v_redundancy,
+        # matched-memory recency/random, reference-code value_l2, or the
+        # published paged_eviction ratio score. All
         # are honored by select_evicted_to_budget, so no policy restriction here
         # -- exactly as on the coupled decode_evict_budget path above.
         for _name, _frac in (
