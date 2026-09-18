@@ -39,7 +39,9 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
+import re
 import statistics
 import subprocess
 import sys
@@ -126,6 +128,119 @@ def _read_decode_evictions(llm) -> int:
     except Exception as e:
         print(f"[ablation] WARN could not read decode evictions: {e}")
         return -1
+
+
+def _performance_metrics(outs, out_lens: list[int], wall: float) -> dict[str, float]:
+    """Compute batch throughput plus engine-side TTFT and TPOT summaries.
+
+    Args:
+        outs: Request outputs returned by ``LLM.generate``.
+        out_lens: Generated-token counts aligned with ``outs``.
+        wall: End-to-end batch wall time in seconds.
+
+    Returns:
+        Numeric throughput, TTFT, and TPOT summary fields. Latencies are zero
+        when the engine build does not expose request timing metrics.
+    """
+    total_tokens = sum(out_lens)
+    ttfts: list[float] = []
+    tpots: list[float] = []
+    for output, token_count in zip(outs, out_lens):
+        metrics = getattr(output, "metrics", None)
+        if metrics is None:
+            continue
+        ttft = getattr(metrics, "first_token_latency", None)
+        first = getattr(metrics, "first_token_ts", None)
+        last = getattr(metrics, "last_token_ts", None)
+        if ttft is not None and ttft > 0:
+            ttfts.append(float(ttft) * 1000.0)
+        if first and last and token_count > 1 and last > first:
+            tpots.append((float(last) - float(first)) * 1000.0 / (token_count - 1))
+
+    def summarize(values: list[float], prefix: str) -> dict[str, float]:
+        if not values:
+            return {
+                f"{prefix}_mean": 0.0,
+                f"{prefix}_p50": 0.0,
+                f"{prefix}_p95": 0.0,
+            }
+        ordered = sorted(values)
+        p95_index = min(len(ordered) - 1, math.ceil(0.95 * len(ordered)) - 1)
+        return {
+            f"{prefix}_mean": round(statistics.fmean(ordered), 3),
+            f"{prefix}_p50": round(statistics.median(ordered), 3),
+            f"{prefix}_p95": round(ordered[p95_index], 3),
+        }
+
+    result = {
+        "throughput_tok_s": round(total_tokens / wall, 3) if wall > 0 else 0.0,
+        "total_output_tokens": float(total_tokens),
+    }
+    result.update(summarize(ttfts, "ttft_ms"))
+    result.update(summarize(tpots, "tpot_ms"))
+    return result
+
+
+def _answer_logprob_metrics(output: Any, prompt_id: str) -> dict[str, float]:
+    """Summarize sampled-token log probabilities for one generated answer."""
+    token_ids = list(output.outputs[0].token_ids)
+    steps = output.outputs[0].logprobs
+    if steps is None or len(steps) != len(token_ids):
+        raise RuntimeError(f"missing or misaligned logprobs for {prompt_id}")
+    chosen = []
+    for token_id, step in zip(token_ids, steps):
+        item = step.get(token_id)
+        if item is None:
+            raise RuntimeError(f"sampled token absent from logprobs for {prompt_id}")
+        chosen.append(float(item.logprob))
+    if not chosen:
+        return {
+            "mean_logprob": 0.0,
+            "sum_logprob": 0.0,
+            "min_logprob": 0.0,
+            "geometric_mean_probability": 0.0,
+        }
+    mean_logprob = statistics.fmean(chosen)
+    return {
+        "mean_logprob": mean_logprob,
+        "sum_logprob": sum(chosen),
+        "min_logprob": min(chosen),
+        "geometric_mean_probability": math.exp(mean_logprob),
+    }
+
+
+def _parse_verbalized_confidence(text: str) -> float | None:
+    """Parse the first standalone 0--100 confidence value from model text."""
+    match = re.search(r"(?<![\d.])(100(?:\.0+)?|\d{1,2}(?:\.\d+)?)(?![\d.])", text)
+    if match is None:
+        return None
+    raw = match.group(1)
+    value = float(raw)
+    if "." in raw and 0.0 <= value <= 1.0:
+        return value
+    return value / 100.0 if 0.0 <= value <= 100.0 else None
+
+
+def _confidence_prompt(tokenizer: Any, prompt: dict, answer: str) -> list[int]:
+    """Build the independent second-pass confidence-elicitation prompt."""
+    task_text = tokenizer.decode(prompt["token_ids"], skip_special_tokens=True)
+    if prompt["task"] in {"gov_report", "multi_news"}:
+        criterion = (
+            "accurate, supported by the source document, and sufficiently complete"
+        )
+    else:
+        criterion = "correct"
+    content = (
+        "Estimate the probability that the proposed answer below is "
+        f"{criterion}. Respond with only one integer from 0 to 100, with no "
+        "percent sign or explanation.\n\n"
+        f"ORIGINAL TASK:\n{task_text}\n\nPROPOSED ANSWER:\n{answer}"
+    )
+    return tokenizer.apply_chat_template(
+        [{"role": "user", "content": content}],
+        tokenize=True,
+        add_generation_prompt=True,
+    )
 
 
 def _max_repetition_run(text: str) -> int:
@@ -301,7 +416,14 @@ def run_single(args) -> None:
     # Accuracy mode: respect EOS + per-task max_gen so qa_f1 reflects real answer
     # quality. Admission eviction fires at end-of-prefill; decode eviction fires
     # only if generation regrows the (compacted) cache back to its capacity.
-    sps = [SamplingParams(temperature=0.0, max_tokens=p["max_gen"]) for p in prompts]
+    sps = [
+        SamplingParams(
+            temperature=0.0,
+            max_tokens=p["max_gen"],
+            logprobs=args.confidence_logprobs if args.confidence_eval else None,
+        )
+        for p in prompts
+    ]
 
     ts: list[float] = []
     used: list[int] = []
@@ -325,6 +447,59 @@ def run_single(args) -> None:
     texts = [o.outputs[0].text for o in outs]
     out_lens = [len(o.outputs[0].token_ids) for o in outs]
     token_ids = [list(o.outputs[0].token_ids) for o in outs]
+    answer_logprobs: list[dict[str, float]] | None = None
+    verbalized_confidence: list[float | None] | None = None
+    verbalized_confidence_raw: list[str] | None = None
+    confidence_wall = 0.0
+    if args.confidence_eval:
+        answer_logprobs = [
+            _answer_logprob_metrics(output, prompt["prompt_id"])
+            for prompt, output in zip(prompts, outs)
+        ]
+        confidence_ids = [
+            _confidence_prompt(tokenizer, prompt, answer)
+            for prompt, answer in zip(prompts, texts)
+        ]
+        if any(len(ids) + args.confidence_max_tokens > args.max_model_len
+               for ids in confidence_ids):
+            raise RuntimeError(
+                "confidence prompt exceeds max_model_len; raise the model limit"
+            )
+        confidence_requests = [
+            TokensPrompt(prompt_token_ids=ids) for ids in confidence_ids
+        ]
+        confidence_params = SamplingParams(
+            temperature=0.0,
+            max_tokens=args.confidence_max_tokens,
+        )
+        confidence_started = time.perf_counter()
+        confidence_outputs = llm.generate(
+            confidence_requests,
+            confidence_params,
+        )
+        confidence_wall = time.perf_counter() - confidence_started
+        verbalized_confidence_raw = [
+            output.outputs[0].text.strip() for output in confidence_outputs
+        ]
+        verbalized_confidence = [
+            _parse_verbalized_confidence(text)
+            for text in verbalized_confidence_raw
+        ]
+    performance = _performance_metrics(outs, out_lens, wall)
+    total_prompt_tokens = sum(len(prompt["token_ids"]) for prompt in prompts)
+    performance.update(
+        {
+            "request_throughput_req_s": round(len(prompts) / wall, 3),
+            "prompt_throughput_tok_s": round(total_prompt_tokens / wall, 3),
+            "total_prompt_tokens": float(total_prompt_tokens),
+        }
+        if wall > 0
+        else {
+            "request_throughput_req_s": 0.0,
+            "prompt_throughput_tok_s": 0.0,
+            "total_prompt_tokens": float(total_prompt_tokens),
+        }
+    )
     # Score with each task's canonical LongBench metric: token-F1 for QA tasks,
     # ROUGE-L for the summarization tasks (gov_report, multi_news). The column is
     # still named "qa_f1"/"f1s" for schema stability across stages; the actual
@@ -392,6 +567,7 @@ def run_single(args) -> None:
         ),
         "max_repetition_run": max_rep,
         "wall_s": round(wall, 2),
+        **performance,
         # Per-prompt F1s + ids let the orchestrator pair and bootstrap CIs.
         "f1s": [round(x, 4) for x in f1s],
         "prompt_ids": [p["prompt_id"] for p in prompts],
@@ -400,10 +576,50 @@ def run_single(args) -> None:
         # Token ids drive the frac=1.0 prefill_only == baseline self-check.
         "token_ids": token_ids,
     }
+    if args.confidence_eval:
+        assert answer_logprobs is not None
+        assert verbalized_confidence is not None
+        assert verbalized_confidence_raw is not None
+        parsed = [value for value in verbalized_confidence if value is not None]
+        result.update(
+            {
+                "confidence_eval": True,
+                "confidence_logprobs": args.confidence_logprobs,
+                "answer_logprob_metrics": answer_logprobs,
+                "verbalized_confidence": verbalized_confidence,
+                "verbalized_confidence_raw": verbalized_confidence_raw,
+                "verbalized_confidence_parse_rate": round(
+                    len(parsed) / len(prompts), 4
+                ),
+                "mean_answer_logprob": round(
+                    statistics.fmean(
+                        item["mean_logprob"] for item in answer_logprobs
+                    ),
+                    6,
+                ),
+                "mean_answer_probability": round(
+                    statistics.fmean(
+                        item["geometric_mean_probability"]
+                        for item in answer_logprobs
+                    ),
+                    6,
+                ),
+                "mean_verbalized_confidence": (
+                    round(statistics.fmean(parsed), 6) if parsed else None
+                ),
+                "confidence_pass_wall_s": round(confidence_wall, 3),
+            }
+        )
     if args.dump_json:
         with open(args.dump_json, "w") as f:
             json.dump(result, f)
-    summary = {k: v for k, v in result.items() if k != "token_ids"}
+    verbose_fields = {
+        "token_ids",
+        "answer_logprob_metrics",
+        "verbalized_confidence",
+        "verbalized_confidence_raw",
+    }
+    summary = {k: v for k, v in result.items() if k not in verbose_fields}
     print("[ablation] result:", json.dumps(summary, indent=2))
     if geo_cfg is not None and geo_cfg.get("enable_tracing"):
         try:
@@ -429,6 +645,7 @@ def _spawn(
     r2r_cover_depth: int = 2,
     r2r_query_aggregation: str = "max",
     r2r_relevance_signal: str = "key_anchor",
+    eviction_policy: str | None = None,
 ) -> dict:
     """Spawn one engine subprocess for one arm and return its result dict.
 
@@ -440,6 +657,8 @@ def _spawn(
     """
     if watermark is None:
         watermark = args.watermark
+    if eviction_policy is None:
+        eviction_policy = args.eviction_policy
     cmd = [
         sys.executable,
         os.path.abspath(__file__),
@@ -465,7 +684,7 @@ def _spawn(
         "--score-sampled-layers",
         args.score_sampled_layers,
         "--eviction-policy",
-        args.eviction_policy,
+        eviction_policy,
         *(
             ["--redundancy-mode", str(args.redundancy_mode)]
             if getattr(args, "redundancy_mode", None)
@@ -493,6 +712,17 @@ def _spawn(
                 str(args.value_norm_protect_quantile),
             ]
             if getattr(args, "value_norm_protect_quantile", None) is not None
+            else []
+        ),
+        *(
+            [
+                "--confidence-eval",
+                "--confidence-logprobs",
+                str(args.confidence_logprobs),
+                "--confidence-max-tokens",
+                str(args.confidence_max_tokens),
+            ]
+            if args.confidence_eval
             else []
         ),
         "--model",
@@ -617,6 +847,32 @@ def _build_arms(args) -> list[dict]:
                 }
             )
 
+        def add_paged_arm(trigger: str) -> None:
+            drip = trigger == "drip"
+            arms.append(
+                {
+                    "regime": "decode_rate" if drip else "prefill_only",
+                    "frac": 1.0 if drip else args.r2r_band_frac,
+                    "blocks": args.r2r_drip_blocks if drip else 0,
+                    "pressure_wm": 0.0,
+                    "eviction_policy": "paged_eviction",
+                    "tag": f"paged_eviction_{trigger}",
+                }
+            )
+
+        def add_streamingllm_arm(trigger: str) -> None:
+            drip = trigger == "drip"
+            arms.append(
+                {
+                    "regime": "decode_rate" if drip else "prefill_only",
+                    "frac": 1.0 if drip else args.r2r_band_frac,
+                    "blocks": args.r2r_drip_blocks if drip else 0,
+                    "pressure_wm": 0.0,
+                    "eviction_policy": "recency",
+                    "tag": f"streamingllm_{trigger}",
+                }
+            )
+
         for factor in band_ns:
             add_arm("band", factor)
         for factor in drip_ns:
@@ -631,6 +887,12 @@ def _build_arms(args) -> list[dict]:
                 add_arm(trigger, factor, aggregation=aggregation)
             for signal in signals:
                 add_arm(trigger, factor, signal=signal)
+        if args.r2r_include_paged_eviction:
+            add_paged_arm("band")
+            add_paged_arm("drip")
+        if args.r2r_include_streamingllm:
+            add_streamingllm_arm("band")
+            add_streamingllm_arm("drip")
         return arms
     if stage == "A":
         blocks = [int(x) for x in args.blocks_list.split(",") if x.strip()]
@@ -719,6 +981,7 @@ def run_ablation(args) -> None:
             r2r_cover_depth=arm.get("cover_depth", 2),
             r2r_query_aggregation=arm.get("query_aggregation", "max"),
             r2r_relevance_signal=arm.get("relevance_signal", "key_anchor"),
+            eviction_policy=arm.get("eviction_policy"),
         )
         band_f1, base_f1 = _align_f1(run, base_by_id)
         mean_delta, lo, hi = _paired_delta_ci(band_f1, base_f1, seed=args.seed)
@@ -784,7 +1047,66 @@ def run_ablation(args) -> None:
                 "peak_blocks": run["peak_blocks"],
                 "baseline_steady_blocks": base_steady,
                 "baseline_preemptions": base.get("preemptions", -1),
+                "baseline_qa_f1": base.get("qa_f1", 0.0),
+                "baseline_wall_s": base.get("wall_s", 0.0),
+                "baseline_throughput_tok_s": base.get(
+                    "throughput_tok_s", 0.0
+                ),
+                "baseline_ttft_ms_mean": base.get("ttft_ms_mean", 0.0),
+                "baseline_tpot_ms_mean": base.get("tpot_ms_mean", 0.0),
                 "mean_out_len": run["mean_out_len"],
+                "wall_s": run.get("wall_s", 0.0),
+                "throughput_tok_s": run.get("throughput_tok_s", 0.0),
+                "request_throughput_req_s": run.get(
+                    "request_throughput_req_s", 0.0
+                ),
+                "prompt_throughput_tok_s": run.get(
+                    "prompt_throughput_tok_s", 0.0
+                ),
+                "ttft_ms_mean": run.get("ttft_ms_mean", 0.0),
+                "ttft_ms_p50": run.get("ttft_ms_p50", 0.0),
+                "ttft_ms_p95": run.get("ttft_ms_p95", 0.0),
+                "tpot_ms_mean": run.get("tpot_ms_mean", 0.0),
+                "tpot_ms_p50": run.get("tpot_ms_p50", 0.0),
+                "tpot_ms_p95": run.get("tpot_ms_p95", 0.0),
+                "mean_answer_logprob": run.get("mean_answer_logprob"),
+                "baseline_mean_answer_logprob": base.get(
+                    "mean_answer_logprob"
+                ),
+                "mean_answer_logprob_delta": (
+                    round(
+                        run["mean_answer_logprob"]
+                        - base["mean_answer_logprob"],
+                        6,
+                    )
+                    if run.get("mean_answer_logprob") is not None
+                    and base.get("mean_answer_logprob") is not None
+                    else None
+                ),
+                "mean_answer_probability": run.get("mean_answer_probability"),
+                "baseline_mean_answer_probability": base.get(
+                    "mean_answer_probability"
+                ),
+                "mean_verbalized_confidence": run.get(
+                    "mean_verbalized_confidence"
+                ),
+                "baseline_mean_verbalized_confidence": base.get(
+                    "mean_verbalized_confidence"
+                ),
+                "verbalized_confidence_delta": (
+                    round(
+                        run["mean_verbalized_confidence"]
+                        - base["mean_verbalized_confidence"],
+                        6,
+                    )
+                    if run.get("mean_verbalized_confidence") is not None
+                    and base.get("mean_verbalized_confidence") is not None
+                    else None
+                ),
+                "verbalized_confidence_parse_rate": run.get(
+                    "verbalized_confidence_parse_rate"
+                ),
+                "confidence_pass_wall_s": run.get("confidence_pass_wall_s"),
             }
         )
 
@@ -931,6 +1253,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--gpu-mem-util", type=float, default=0.9)
     p.add_argument("--sample-ms", type=int, default=5)
+    p.add_argument(
+        "--confidence-eval",
+        action="store_true",
+        help="Capture answer log-probability summaries and run an independent "
+        "verbalized-confidence pass over each frozen answer.",
+    )
+    p.add_argument(
+        "--confidence-logprobs",
+        type=int,
+        default=1,
+        help="Number of output logprobs requested during answer generation.",
+    )
+    p.add_argument(
+        "--confidence-max-tokens",
+        type=int,
+        default=8,
+        help="Maximum tokens for the confidence-only numeric response.",
+    )
     p.add_argument("--run-id", default="ablation")
     p.add_argument("--output-dir", default=None)
     p.add_argument(
@@ -988,6 +1328,20 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="R2R stage: blocks evicted per decode drip fire.",
+    )
+    p.add_argument(
+        "--r2r-include-paged-eviction",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="R2R stage: add matched admission-band and decode-drip arms using "
+        "the published PagedEviction V/K ratio score.",
+    )
+    p.add_argument(
+        "--r2r-include-streamingllm",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="R2R stage: add matched admission-band and decode-drip arms using "
+        "StreamingLLM-style oldest-first eviction with sink protection.",
     )
     p.add_argument(
         "--regimes",
@@ -1070,6 +1424,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    if not 0 <= args.confidence_logprobs <= 20:
+        raise SystemExit("--confidence-logprobs must be in [0, 20]")
+    if args.confidence_max_tokens < 1:
+        raise SystemExit("--confidence-max-tokens must be positive")
     if args.single:
         run_single(args)
     else:

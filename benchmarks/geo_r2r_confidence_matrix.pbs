@@ -1,0 +1,78 @@
+#!/bin/bash
+#PBS -N geo_r2r_conf
+#PBS -l filesystems=home:eagle
+#PBS -l select=1:ncpus=8:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -q by-gpu
+#PBS -A datascience_collab
+#PBS -r y
+#PBS -J 0-14
+
+# Two-pass confidence sweep over the same 3-model x 5-task x 20-arm matrix as
+# geo_r2r_full_matrix.pbs, plus one shared no-eviction baseline per array cell.
+
+set -euo pipefail
+cd /home/nhogg/vllm-ce
+
+export LD_PRELOAD=/soft/libraries/nccl/nccl_2.30.4-1+cuda13.2_x86_64/lib/libnccl.so
+export OPENBLAS_NUM_THREADS=1
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export TOKENIZERS_PARALLELISM=false
+export HF_HUB_OFFLINE=1
+export VLLM_USE_V2_MODEL_RUNNER=1
+export VLLM_ENABLE_V1_MULTIPROCESSING=0
+export VLLM_USE_FLASHINFER_SAMPLER=0
+
+MODELS=(
+  Llama-3.2-1B-Instruct
+  Llama-3.2-3B-Instruct
+  Llama-3.1-8B-Instruct
+)
+MODEL_TAGS=(1b 3b 8b)
+LAYERS=("2,6,10,14" "3,10,17,24" "3,11,20,28")
+TASKS=(qasper gov_report multi_news hotpotqa multifieldqa_en)
+
+INDEX="${PBS_ARRAY_INDEX:-0}"
+MODEL_INDEX=$((INDEX / 5))
+TASK_INDEX=$((INDEX % 5))
+MODEL_NAME="${MODELS[$MODEL_INDEX]}"
+MODEL_TAG="${MODEL_TAGS[$MODEL_INDEX]}"
+TASK="${TASKS[$TASK_INDEX]}"
+MODEL="${GEO_MODEL_ROOT:-/eagle/datascience_collab/nhogg}/${MODEL_NAME}"
+
+if [[ "${TASK}" == "multifieldqa_en" ]]; then
+  DEFAULT_PROMPTS=150
+else
+  DEFAULT_PROMPTS=200
+fi
+NUM_PROMPTS="${GEO_NUM_PROMPTS:-${DEFAULT_PROMPTS}}"
+RUN_ID="r2r_confidence_${MODEL_TAG}_${TASK}"
+OUTPUT_ROOT="${GEO_OUTPUT_ROOT:-results/r2r_confidence_matrix}"
+
+echo "confidence matrix index=${INDEX} model=${MODEL_NAME} task=${TASK}"
+
+.venv/bin/python benchmarks/benchmark_kv_eviction_ablation_vllm.py \
+  --model "${MODEL}" \
+  --tasks "${TASK}" \
+  --stage R2R \
+  --confidence-eval \
+  --confidence-logprobs "${GEO_CONFIDENCE_LOGPROBS:-1}" \
+  --confidence-max-tokens "${GEO_CONFIDENCE_MAX_TOKENS:-8}" \
+  --num-prompts "${NUM_PROMPTS}" \
+  --max-prompt-len "${GEO_MAX_PROMPT_LEN:-4096}" \
+  --max-model-len "${GEO_MAX_MODEL_LEN:-8192}" \
+  --gpu-mem-util "${GEO_GPU_MEM_UTIL:-0.9}" \
+  --score-sampled-layers "${LAYERS[$MODEL_INDEX]}" \
+  --r2r-band-n "${GEO_R2R_BAND_N:-1,2,3,4}" \
+  --r2r-drip-n "${GEO_R2R_DRIP_N:-2,4,16,64}" \
+  --r2r-depths "${GEO_R2R_DEPTHS:-0,1,2}" \
+  --r2r-aggregations "${GEO_R2R_AGGREGATIONS:-max,mean}" \
+  --r2r-signals "${GEO_R2R_SIGNALS:-key_anchor,attention_mass}" \
+  --r2r-include-paged-eviction \
+  --r2r-include-streamingllm \
+  --run-id "${RUN_ID}" \
+  --output-dir "${OUTPUT_ROOT}/${RUN_ID}"
+
+echo "Finished ${RUN_ID} at $(date)"
