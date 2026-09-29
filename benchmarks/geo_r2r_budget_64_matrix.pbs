@@ -1,0 +1,148 @@
+#!/bin/bash
+#PBS -N geo_r2r_c64
+#PBS -l filesystems=home:eagle
+#PBS -l select=1:ngpus=8:ncpus=256:mem=960gb
+#PBS -l place=scatter:excl
+#PBS -l walltime=24:00:00
+#PBS -q by-node
+#PBS -A datascience_collab
+#PBS -r n
+
+# One non-array job per experiment mode. Each model/task cell owns one GPU.
+# GEO_EXPERIMENT_MODE=accuracy or confidence, GEO_REPEAT_INDEX=1..5.
+# GEO_MODEL_SET=llama (default) or qwen32_awq.
+# Both modes record serving performance from the answer-generation pass.
+
+set -euo pipefail
+cd /home/nhogg/vllm-ce
+export LD_PRELOAD=/soft/libraries/nccl/nccl_2.30.4-1+cuda13.2_x86_64/lib/libnccl.so
+export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false HF_HUB_OFFLINE=1
+export VLLM_USE_V2_MODEL_RUNNER=1 VLLM_ENABLE_V1_MULTIPROCESSING=0
+export VLLM_USE_FLASHINFER_SAMPLER=0
+
+MODE="${GEO_EXPERIMENT_MODE:-accuracy}"
+case "${MODE}" in
+  accuracy|confidence) ;;
+  *) echo "GEO_EXPERIMENT_MODE must be accuracy or confidence" >&2; exit 2 ;;
+esac
+
+MODEL_SET="${GEO_MODEL_SET:-llama}"
+case "${MODEL_SET}" in
+  llama)
+    MODELS=(Llama-3.2-1B-Instruct Llama-3.2-3B-Instruct Llama-3.1-8B-Instruct)
+    MODEL_TAGS=(1b 3b 8b)
+    LAYERS=("2,6,10,14" "3,10,17,24" "3,11,20,28")
+    DEFAULT_OUTPUT_PARENT="results/r2r_budget_64_${MODE}"
+    ;;
+  qwen32_awq)
+    MODELS=(Qwen2.5-32B-Instruct-AWQ)
+    MODEL_TAGS=(qwen32_awq)
+    LAYERS=("7,23,39,55")
+    DEFAULT_OUTPUT_PARENT="results/r2r_budget_64_qwen32_awq_${MODE}"
+    ;;
+  *) echo "GEO_MODEL_SET must be llama or qwen32_awq" >&2; exit 2 ;;
+esac
+TASKS=(qasper gov_report multi_news hotpotqa multifieldqa_en)
+CAPACITIES="${GEO_CAPACITIES:-16,32,64,128,256}"
+REPEAT="${GEO_REPEAT_INDEX:?set GEO_REPEAT_INDEX to 1, 2, 3, 4, or 5}"
+if [[ ! "${REPEAT}" =~ ^[1-5]$ ]]; then
+  echo "GEO_REPEAT_INDEX must be an integer from 1 to 5" >&2
+  exit 2
+fi
+OUTPUT_PARENT="${GEO_OUTPUT_ROOT:-${DEFAULT_OUTPUT_PARENT}}"
+OUTPUT_ROOT="${OUTPUT_PARENT}/repeat_$(printf '%02d' "${REPEAT}")"
+if [[ -e "${OUTPUT_ROOT}" ]]; then
+  echo "Repeat output already exists: ${OUTPUT_ROOT}" >&2
+  exit 2
+fi
+LOG_DIR="${OUTPUT_ROOT}/logs"
+
+for model_name in "${MODELS[@]}"; do
+  model_path="${GEO_MODEL_ROOT:-/eagle/datascience_collab/nhogg}/${model_name}"
+  if [[ ! -f "${model_path}/config.json" ]]; then
+    echo "Missing model config: ${model_path}/config.json" >&2
+    exit 2
+  fi
+done
+
+echo "mode=${MODE} model_set=${MODEL_SET} capacities=${CAPACITIES} output=${OUTPUT_ROOT}"
+nvidia-smi -L
+mkdir -p "${OUTPUT_PARENT}"
+mkdir "${OUTPUT_ROOT}" || {
+  echo "Repeat output was claimed by another job: ${OUTPUT_ROOT}" >&2
+  exit 2
+}
+mkdir "${LOG_DIR}"
+
+run_cell() {
+  local gpu="$1" index="$2" mi=$((index / 5)) ti=$((index % 5))
+  local model_name="${MODELS[$mi]}" tag="${MODEL_TAGS[$mi]}"
+  local task="${TASKS[$ti]}" default_prompts=200
+  [[ "${task}" == "multifieldqa_en" ]] && default_prompts=150
+  local run_id="r2r_budget_all_methods_${tag}_${task}"
+  local -a confidence_flags=()
+  if [[ "${MODE}" == confidence ]]; then
+    run_id="r2r_budget_all_methods_confidence_${tag}_${task}"
+    confidence_flags=(
+      --confidence-eval
+      --confidence-logprobs "${GEO_CONFIDENCE_LOGPROBS:-1}"
+      --confidence-max-tokens "${GEO_CONFIDENCE_MAX_TOKENS:-8}"
+    )
+  fi
+  echo "[launch] GPU=${gpu} model=${model_name} task=${task} mode=${MODE}"
+  CUDA_VISIBLE_DEVICES="${gpu}" .venv/bin/python \
+    benchmarks/benchmark_kv_capacity_band_vllm.py \
+    --sweep --sweep-axis capacity "${confidence_flags[@]}" \
+    --capacities "${CAPACITIES}" --budget-unit blocks \
+    --watermark "${GEO_WATERMARK:-0.75}" \
+    --model "${GEO_MODEL_ROOT:-/eagle/datascience_collab/nhogg}/${model_name}" \
+    --tasks "${task}" --num-prompts "${GEO_NUM_PROMPTS:-${default_prompts}}" \
+    --max-prompt-len "${GEO_MAX_PROMPT_LEN:-4096}" \
+    --max-model-len "${GEO_MAX_MODEL_LEN:-8192}" \
+    --gpu-mem-util "${GEO_GPU_MEM_UTIL:-0.9}" \
+    --eviction-policy v_redundancy --score-sampled-layers "${LAYERS[$mi]}" \
+    --comparison-policies v_redundancy,paged_eviction,recency \
+    --candidate-expansion-factor 4 --r2r-cover-depth 2 \
+    --r2r-query-aggregation max --r2r-relevance-signal key_anchor \
+    --run-id "${run_id}" --output-dir "${OUTPUT_ROOT}/${run_id}" \
+    > "${LOG_DIR}/${run_id}.log" 2>&1 &
+}
+
+wave() {
+  local -a pids=() names=()
+  local spec gpu index mi ti i rc=0
+  for spec in "$@"; do
+    IFS=: read -r gpu index <<< "${spec}"
+    mi=$((index / 5)); ti=$((index % 5))
+    if [[ "${MODE}" == confidence ]]; then
+      names+=("r2r_budget_all_methods_confidence_${MODEL_TAGS[$mi]}_${TASKS[$ti]}")
+    else
+      names+=("r2r_budget_all_methods_${MODEL_TAGS[$mi]}_${TASKS[$ti]}")
+    fi
+    run_cell "${gpu}" "${index}"
+    pids+=("$!")
+    sleep 15
+  done
+  for i in "${!pids[@]}"; do
+    if wait "${pids[$i]}"; then
+      echo "OK ${names[$i]}"
+    else
+      echo "FAIL ${names[$i]} (see ${LOG_DIR}/${names[$i]}.log)" >&2
+      rc=1
+    fi
+  done
+  return "${rc}"
+}
+
+rc_total=0
+num_cells=$((${#MODELS[@]} * ${#TASKS[@]}))
+for ((start=0; start<num_cells; start+=8)); do
+  specs=()
+  for ((index=start; index<num_cells && index<start+8; index++)); do
+    specs+=("$((index - start)):${index}")
+  done
+  wave "${specs[@]}" || rc_total=1
+done
+echo "Finished ${MODE} at $(date) rc_total=${rc_total}"
+exit "${rc_total}"

@@ -1,0 +1,46 @@
+#!/bin/bash
+#PBS -N geo_qwen32_smoke
+#PBS -l filesystems=home:eagle
+#PBS -l select=1:ngpus=8:ncpus=256:mem=960gb
+#PBS -l place=scatter:excl
+#PBS -l walltime=04:00:00
+#PBS -q by-node
+#PBS -A datascience_collab
+#PBS -r n
+
+# One-GPU integration smoke for Qwen2.5-32B-Instruct-AWQ. The exclusive node
+# prevents another job from sharing the physical GPU during memory profiling.
+
+set -euo pipefail
+cd /home/nhogg/vllm-ce
+export LD_PRELOAD=/soft/libraries/nccl/nccl_2.30.4-1+cuda13.2_x86_64/lib/libnccl.so
+export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false HF_HUB_OFFLINE=1
+export VLLM_USE_V2_MODEL_RUNNER=1 VLLM_ENABLE_V1_MULTIPROCESSING=0
+export VLLM_USE_FLASHINFER_SAMPLER=0
+
+MODEL=/eagle/datascience_collab/nhogg/Qwen2.5-32B-Instruct-AWQ
+if [[ ! -f "${MODEL}/config.json" ]]; then
+  echo "Missing model: ${MODEL}" >&2
+  exit 2
+fi
+
+JOB_TAG="${PBS_JOBID%%.*}"
+OUTPUT_ROOT="results/r2r_qwen32_awq_smoke/${JOB_TAG}"
+mkdir -p "${OUTPUT_ROOT}"
+echo "host=$(hostname) model=${MODEL} output=${OUTPUT_ROOT}"
+nvidia-smi -L
+
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python \
+  benchmarks/benchmark_kv_capacity_band_vllm.py \
+  --sweep --sweep-axis capacity --confidence-eval \
+  --confidence-logprobs 1 --confidence-max-tokens 8 \
+  --capacities 64 --budget-unit blocks --watermark 0.75 \
+  --model "${MODEL}" --tasks qasper --num-prompts 4 \
+  --max-prompt-len 4096 --max-model-len 8192 --gpu-mem-util 0.9 \
+  --eviction-policy v_redundancy --score-sampled-layers 7,23,39,55 \
+  --comparison-policies v_redundancy,paged_eviction,recency \
+  --candidate-expansion-factor 4 --r2r-cover-depth 2 \
+  --r2r-query-aggregation max --r2r-relevance-signal key_anchor \
+  --run-id r2r_budget_all_methods_confidence_qwen32_awq_qasper \
+  --output-dir "${OUTPUT_ROOT}/r2r_budget_all_methods_confidence_qwen32_awq_qasper"
