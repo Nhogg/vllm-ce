@@ -514,7 +514,20 @@ def select_evicted_r2r(
     if protected_blocks is not None:
         if protected_blocks.shape != (num_blocks,):
             raise ValueError("protected_blocks must match num_blocks")
-        protected = protected_blocks.detach().to(device=device, dtype=torch.bool)
+        protected_cpu = protected_blocks.detach().to(
+            device="cpu", dtype=torch.bool
+        )
+        if selection_stats is not None:
+            selection_stats["prompt_floor_blocks"] = int(
+                protected_cpu.sum().item()
+            )
+            selection_stats["prompt_floor_sink_overlap"] = int(
+                protected_cpu[:lo].sum().item()
+            )
+            selection_stats["prompt_floor_anchor_overlap"] = int(
+                protected_cpu[-1].item()
+            )
+        protected = protected_cpu.to(device=device)
         eligible = eligible[~protected[eligible]]
     window_size = eligible.numel()
     if window_size <= 0:
@@ -559,6 +572,7 @@ def select_evicted_r2r(
                 forced_trusted.numel()
             )
     remaining = k - forced_trusted.numel()
+    forced_trusted_cpu = forced_trusted.to(device="cpu")
     relevance = query_relevance.detach().to(
         device=candidates.device, dtype=torch.float32
     )
@@ -607,7 +621,7 @@ def select_evicted_r2r(
         decision_rows = decision_table.tolist()
 
         chosen_list: list[int] = []
-        chosen_set: set[int] = set(forced_trusted.tolist())
+        chosen_set: set[int] = set(forced_trusted_cpu.tolist())
         for cover_rank in range(depth):
             for decision in decision_rows:
                 candidate = decision[0]
@@ -638,7 +652,7 @@ def select_evicted_r2r(
                         break
         chosen = torch.tensor(chosen_list, dtype=torch.long, device="cpu")
     evict[chosen] = True
-    evict[forced_trusted.to(device="cpu")] = True
+    evict[forced_trusted_cpu] = True
     return evict
 
 

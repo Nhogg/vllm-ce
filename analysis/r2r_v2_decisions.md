@@ -1,7 +1,9 @@
 # R2R v2: implementation decisions
 
-Status: floor and dispersion phase implemented as opt-in flags; token-max and
-incremental pair-cost caching remain deferred. This resolves the open choices in
+Status: floor and dispersion phase implemented as opt-in flags. A standalone
+token-max scoring primitive and CUDA timing probe exist, but token-max is not
+wired into eviction; incremental pair-cost caching remains deferred. This
+resolves the open choices in
 the revised v2 proposal against the current `fix/geo-kv` selector. The existing
 v1 experiments remain the control. In particular, these choices do not claim
 that a protective change cannot reduce accuracy: a fixed budget means every

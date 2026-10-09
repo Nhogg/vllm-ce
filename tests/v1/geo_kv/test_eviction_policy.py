@@ -15,6 +15,7 @@ from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
 from vllm.v1.geo_kv.config import GeoKVConfig, resolve_indices
 from vllm.v1.geo_kv.eviction_policy import (
+    EvictionPolicy,
     aggregate_layer_scores,
     prompt_tail_floor_mask,
     select_evicted_blocks,
@@ -31,6 +32,7 @@ from vllm.v1.geo_kv.scoring import (
     block_multi_prototype_redundancy,
     block_paged_eviction_score,
     block_pair_residual_cost,
+    block_token_max_relevance,
     block_value_outlier_ratio,
     block_prototypes,
     block_query_attention_mass,
@@ -260,6 +262,8 @@ def test_r2r_v2_protected_floor_and_trusted_priority():
     assert not bool((mask & protected).any())
     assert not bool((mask & flagged).any())
     assert stats["forced_flagged"] == 0
+    assert stats["prompt_floor_blocks"] == 2
+    assert stats["prompt_floor_anchor_overlap"] == 0
     with pytest.raises(ValueError, match="protected floor"):
         select_evicted_r2r(
             scores, relevance, 8, 2, 1, 2.0, protected_blocks=protected
@@ -275,6 +279,20 @@ def test_r2r_v2_prompt_tail_floor_handles_unaligned_end():
     ).flatten().tolist() == [2, 3, 4]
 
 
+def test_r2r_v2_floor_tracks_physical_compaction():
+    policy = object.__new__(EvictionPolicy)
+    policy.config = GeoKVConfig(r2r_persistent_floor=True)
+    policy._r2r_prompt_floor = {
+        0: torch.tensor([False, False, True, True, True])
+    }
+    policy._r2r_floor_pending = {
+        0: torch.tensor([False, True, False, False, False])
+    }
+    policy.on_compaction_applied(0, 4)
+    assert policy._r2r_prompt_floor[0].tolist() == [False, True, True, True]
+    assert 0 not in policy._r2r_floor_pending
+
+
 def test_r2r_v2_dispersion_detects_one_outlier():
     values = torch.ones(2, 16, 1, 4)
     values[1, 0] = 20
@@ -282,6 +300,23 @@ def test_r2r_v2_dispersion_detects_one_outlier():
     assert ratios.shape == (2, 1)
     assert ratios[0, 0] == 1
     assert ratios[1, 0] > 2
+    partial = values[:1].clone()
+    partial[0, 1:] = 1000
+    assert block_value_outlier_ratio(partial, torch.tensor([1]))[0, 0] == 1
+
+
+def test_r2r_v2_token_max_respects_causal_mask_and_gqa():
+    queries = torch.tensor([[[10.0], [10.0]], [[0.0], [0.0]]])
+    keys = torch.tensor([[[[1.0]], [[1.0]]], [[[1.0]], [[100.0]]]])
+    relevance = block_token_max_relevance(
+        queries,
+        keys,
+        torch.tensor([2, 2]),
+        torch.tensor([0, 1]),
+        total_valid=4,
+        scale=1.0,
+    )
+    assert relevance.tolist() == [10.0, 10.0]
 
 
 def test_r2r_v2_forced_flagged_fallback_keeps_exact_budget():

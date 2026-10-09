@@ -832,6 +832,62 @@ def block_key_anchor_relevance(
     return relevance.to(torch.float32)
 
 
+def block_token_max_relevance(
+    queries: torch.Tensor,
+    k_blocks: torch.Tensor,
+    valid_lens: torch.Tensor,
+    block_indices: torch.Tensor,
+    total_valid: int,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """Score selected blocks by their strongest causal query/token match.
+
+    This is an experimental primitive for the v2 timing and rank audit; the
+    production selector does not call it yet. ``block_indices`` are positions
+    in the full compacted cache, so a candidate subset retains correct causal
+    positions.
+
+    Args:
+        queries: Captured queries shaped ``(W, Hq, D)``.
+        k_blocks: Selected key blocks shaped ``(C, S, Hkv, D)``.
+        valid_lens: Valid token counts for the selected blocks.
+        block_indices: Their indices in the full compacted cache.
+        total_valid: Number of valid tokens in the full compacted cache.
+        scale: Query-key scale, defaulting to ``D**-0.5``.
+
+    Returns:
+        One token-max logit for each selected block.
+    """
+    if queries.ndim != 3 or k_blocks.ndim != 4:
+        raise ValueError("queries and keys must have rank 3 and 4")
+    window, query_heads, dim = queries.shape
+    count, block_size, kv_heads, key_dim = k_blocks.shape
+    if (
+        window < 1
+        or count < 1
+        or dim != key_dim
+        or query_heads % kv_heads != 0
+        or valid_lens.shape != (count,)
+        or block_indices.shape != (count,)
+        or total_valid < window
+    ):
+        raise ValueError("incompatible token-max relevance inputs")
+    q = queries.float().reshape(window, kv_heads, query_heads // kv_heads, dim)
+    k = k_blocks.float()
+    valid_lens = valid_lens.to(device=k.device)
+    block_indices = block_indices.to(device=k.device)
+    logits = torch.einsum("whgd,bshd->whgbs", q, k)
+    logits.mul_(float(scale) if scale is not None else dim**-0.5)
+    token_pos = torch.arange(block_size, device=k.device)
+    key_pos = block_indices[:, None] * block_size + token_pos[None, :]
+    query_pos = total_valid - window + torch.arange(window, device=k.device)
+    visible = (token_pos[None, :] < valid_lens[:, None]) & (
+        key_pos[None, :, :] <= query_pos[:, None, None]
+    )
+    logits.masked_fill_(~visible[:, None, None, :, :], float("-inf"))
+    return logits.amax(dim=(0, 1, 2, 4))
+
+
 def refine_with_query_relevance(
     scores: torch.Tensor,
     relevance: torch.Tensor | None,

@@ -1,0 +1,21 @@
+#!/bin/bash
+#PBS -N geo_r2r_tokenmax
+#PBS -l filesystems=home:eagle
+#PBS -l select=1:ncpus=4:ngpus=1
+#PBS -l walltime=00:15:00
+#PBS -q by-gpu
+#PBS -A datascience_collab
+#PBS -r y
+
+set -euo pipefail
+cd /home/nhogg/vllm-ce
+export LD_PRELOAD=/soft/libraries/nccl/nccl_2.30.4-1+cuda13.2_x86_64/lib/libnccl.so
+export OPENBLAS_NUM_THREADS=1
+export OMP_NUM_THREADS=1
+export PYTHONPYCACHEPREFIX=/tmp/r2r-v2-pycache
+
+.venv/bin/python benchmarks/benchmark_r2r_token_max_cuda.py \
+  --blocks "${GEO_BLOCKS:-16,64,256}" \
+  --warmup "${GEO_WARMUP:-10}" \
+  --repeats "${GEO_REPEATS:-30}" \
+  --output "${GEO_OUTPUT:-results/r2r_v2/token_max_microbench.json}"
