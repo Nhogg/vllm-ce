@@ -490,6 +490,41 @@ def block_joint_similarity(anchors: torch.Tensor) -> torch.Tensor:
     return normalized @ normalized.t()
 
 
+def block_value_outlier_ratio(
+    values: torch.Tensor, valid_lens: torch.Tensor
+) -> torch.Tensor:
+    """Return each block's largest per-head max/median value deviation.
+
+    Args:
+        values: Value blocks with shape ``(blocks, tokens, heads, dim)``.
+        valid_lens: Number of valid tokens in each block.
+
+    Returns:
+        Per-block, per-head outlier ratios with shape ``(blocks, heads)``.
+    """
+    tokens = values.shape[1]
+    pos = torch.arange(tokens, device=values.device)[None, :]
+    valid = pos < valid_lens[:, None]
+    vf = values.float()
+    anchor = (vf * valid[:, :, None, None]).sum(dim=1) / (
+        valid_lens.clamp(min=1).float()[:, None, None]
+    )
+    distances = torch.linalg.vector_norm(vf - anchor[:, None], dim=-1)
+    max_distance = distances.masked_fill(~valid[:, :, None], 0).amax(dim=1)
+    # NaN-masking preserves a true median for partial blocks; a one-token
+    # block has zero deviation and is therefore unflagged.
+    median_distance = torch.nanmedian(
+        distances.masked_fill(~valid[:, :, None], float("nan")), dim=1
+    ).values.nan_to_num(0.0)
+    scale = torch.linalg.vector_norm(vf, dim=-1)
+    scale = scale.masked_fill(~valid[:, :, None], 0).amax(dim=1)
+    eps = torch.finfo(torch.float32).eps * scale
+    ratio = max_distance / torch.maximum(median_distance, eps).clamp_min(
+        torch.finfo(torch.float32).tiny
+    )
+    return torch.where(max_distance == 0, torch.ones_like(ratio), ratio)
+
+
 def block_pair_residual_cost(anchors: torch.Tensor) -> torch.Tensor:
     """Projection-residual cost for every block/cover pair.
 

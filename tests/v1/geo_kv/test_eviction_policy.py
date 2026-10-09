@@ -16,6 +16,7 @@ from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
 from vllm.v1.geo_kv.config import GeoKVConfig, resolve_indices
 from vllm.v1.geo_kv.eviction_policy import (
     aggregate_layer_scores,
+    prompt_tail_floor_mask,
     select_evicted_blocks,
     select_evicted_by_coverage,
     select_evicted_r2r,
@@ -30,6 +31,7 @@ from vllm.v1.geo_kv.scoring import (
     block_multi_prototype_redundancy,
     block_paged_eviction_score,
     block_pair_residual_cost,
+    block_value_outlier_ratio,
     block_prototypes,
     block_query_attention_mass,
     block_value_l2,
@@ -241,6 +243,59 @@ def test_r2r_selects_least_relevant_from_redundancy_shortlist():
     )
 
     assert torch.nonzero(mask).flatten().tolist() == [2, 3]
+
+
+def test_r2r_v2_protected_floor_and_trusted_priority():
+    scores = torch.arange(8, dtype=torch.float32)
+    relevance = scores.clone()
+    protected = torch.tensor([False, False, True, False, False, False, True, False])
+    flagged = torch.tensor([False, True, False, False, False, True, False, False])
+    stats: dict[str, int] = {}
+    mask = select_evicted_r2r(
+        scores, relevance, 8, 6, 1, 2.0,
+        protected_blocks=protected, flagged_blocks=flagged,
+        selection_stats=stats,
+    )
+    assert int(mask.sum()) == 2
+    assert not bool((mask & protected).any())
+    assert not bool((mask & flagged).any())
+    assert stats["forced_flagged"] == 0
+    with pytest.raises(ValueError, match="protected floor"):
+        select_evicted_r2r(
+            scores, relevance, 8, 2, 1, 2.0, protected_blocks=protected
+        )
+
+
+def test_r2r_v2_prompt_tail_floor_handles_unaligned_end():
+    assert torch.nonzero(
+        prompt_tail_floor_mask(64, 16, 32, 4)
+    ).flatten().tolist() == [2, 3]
+    assert torch.nonzero(
+        prompt_tail_floor_mask(65, 16, 32, 5)
+    ).flatten().tolist() == [2, 3, 4]
+
+
+def test_r2r_v2_dispersion_detects_one_outlier():
+    values = torch.ones(2, 16, 1, 4)
+    values[1, 0] = 20
+    ratios = block_value_outlier_ratio(values, torch.tensor([16, 16]))
+    assert ratios.shape == (2, 1)
+    assert ratios[0, 0] == 1
+    assert ratios[1, 0] > 2
+
+
+def test_r2r_v2_forced_flagged_fallback_keeps_exact_budget():
+    scores = torch.arange(6, dtype=torch.float32)
+    relevance = scores.clone()
+    flagged = torch.tensor([False, True, True, True, True, False])
+    stats: dict[str, int] = {}
+    mask = select_evicted_r2r(
+        scores, relevance, 6, 2, 0, 2.0,
+        flagged_blocks=flagged, selection_stats=stats,
+    )
+    assert int(mask.sum()) == 4
+    assert stats["forced_flagged"] == 3
+    assert int((mask & flagged).sum()) == 3
 
 
 def test_r2r_factor_one_matches_pure_redundancy():

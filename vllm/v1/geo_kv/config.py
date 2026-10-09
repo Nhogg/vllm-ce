@@ -307,6 +307,9 @@ class GeoKVConfig:
     # the guard; two matches the algorithm default. The guard remains exact-budget
     # through an unguarded final backfill pass.
     r2r_cover_depth: int = 2
+    # V2 ablations. Keep both off by default to preserve the v1 control.
+    r2r_persistent_floor: bool = False
+    r2r_dispersion_kappa: float | None = None
     # Stage-2 relevance signal. Exact causal attention mass is the established
     # default; key_anchor is the cheaper spec-literal Q dot MeanPool(K) ablation.
     r2r_relevance_signal: str = "attention_mass"
@@ -524,11 +527,6 @@ class GeoKVConfig:
                     "with decode_evict_frac and decode_evict_budget "
                     "(pick one decode eviction mechanism)"
                 )
-            if self.eviction_policy != "v_redundancy":
-                raise ValueError(
-                    "geo_kv.decode_evict_blocks_per_step currently requires "
-                    "eviction_policy='v_redundancy' (the core thesis signal)"
-                )
             if not self.active_eviction:
                 raise ValueError(
                     "geo_kv.decode_evict_blocks_per_step requires an "
@@ -567,6 +565,16 @@ class GeoKVConfig:
             )
         if self.query_tail_tokens < 1:
             raise ValueError("geo_kv.query_tail_tokens must be >= 1")
+        if self.r2r_persistent_floor or self.r2r_dispersion_kappa is not None:
+            if self.candidate_expansion_factor is None:
+                raise ValueError("R2R v2 guards require candidate_expansion_factor")
+            if not self.physical_reclaim:
+                raise ValueError("R2R v2 guards require physical_reclaim")
+        if self.r2r_dispersion_kappa is not None and (
+            not math.isfinite(self.r2r_dispersion_kappa)
+            or self.r2r_dispersion_kappa <= 1.0
+        ):
+            raise ValueError("r2r_dispersion_kappa must be finite and > 1")
         if self.query_relevance_enabled:
             if self.eviction_policy != "v_redundancy":
                 raise ValueError(

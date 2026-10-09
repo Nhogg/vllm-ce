@@ -55,6 +55,7 @@ from vllm.v1.geo_kv.scoring import (
     block_query_attention_mass,
     block_valid_lens,
     block_value_l2,
+    block_value_outlier_ratio,
     positional_cosh_weights,
     query_direction_coherence,
     refine_with_query_relevance,
@@ -71,6 +72,29 @@ logger = init_logger(__name__)
 # Reserved request-id prefix used by kernel warmup; never a real serving request,
 # so never evicted. Dummy runs are excluded explicitly by the model runner.
 _KERNEL_WARMUP_REQ_PREFIX = "_warmup_"
+
+
+def prompt_tail_floor_mask(
+    prompt_len: int, block_size: int, tail_tokens: int, count: int
+) -> torch.Tensor:
+    """Mark all blocks intersecting the final prompt-token window.
+
+    Args:
+        prompt_len: Number of prompt tokens.
+        block_size: Tokens in a KV block.
+        tail_tokens: Length of the protected prompt suffix.
+        count: Number of materialized prompt blocks.
+
+    Returns:
+        CPU Boolean mask over materialized prompt blocks.
+    """
+    first = max(0, prompt_len - tail_tokens) // block_size
+    end = math.ceil(prompt_len / block_size)
+    if count < end:
+        raise RuntimeError("R2R prompt floor cannot map prompt blocks")
+    floor = torch.zeros(count, dtype=torch.bool)
+    floor[first:end] = True
+    return floor
 
 
 def _choose_evicted(
@@ -442,6 +466,8 @@ def select_evicted_r2r(
     cover_cost: torch.Tensor | None = None,
     cover_depth: int = 2,
     selection_stats: dict[str, int] | None = None,
+    protected_blocks: torch.Tensor | None = None,
+    flagged_blocks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Evict least-relevant blocks from a redundancy-ranked shortlist.
 
@@ -483,10 +509,18 @@ def select_evicted_r2r(
         tail = math.ceil(tail_protect_frac * num_blocks)
         tail = max(0, min(tail, (hi - lo) - k))
         hi -= tail
-    window_size = hi - lo
+    device = scores.device
+    eligible = torch.arange(lo, hi, device=device)
+    if protected_blocks is not None:
+        if protected_blocks.shape != (num_blocks,):
+            raise ValueError("protected_blocks must match num_blocks")
+        protected = protected_blocks.detach().to(device=device, dtype=torch.bool)
+        eligible = eligible[~protected[eligible]]
+    window_size = eligible.numel()
     if window_size <= 0:
-        return evict
-    k = min(k, window_size)
+        raise ValueError("R2R budget is below the protected floor")
+    if k > window_size:
+        raise ValueError("R2R budget is below the protected floor")
     candidate_count = min(
         max(int(round(candidate_expansion_factor * k)), k),
         window_size,
@@ -495,9 +529,36 @@ def select_evicted_r2r(
         selection_stats["candidate_blocks"] = candidate_count
         selection_stats["eligible_blocks"] = window_size
 
-    residual_cost = scores.detach()[lo:hi].to(torch.float32)
-    candidate_order = torch.argsort(residual_cost, descending=False, stable=True)
-    candidates = candidate_order[:candidate_count] + lo
+    residual_cost = scores.detach().to(dtype=torch.float32)
+    forced_trusted = torch.empty(0, dtype=torch.long, device=device)
+    if flagged_blocks is None:
+        order = torch.argsort(residual_cost[eligible], stable=True)
+        candidates = eligible[order[:candidate_count]]
+    else:
+        if flagged_blocks.shape != (num_blocks,):
+            raise ValueError("flagged_blocks must match num_blocks")
+        flags = flagged_blocks.detach().to(device=device, dtype=torch.bool)
+        trusted = eligible[~flags[eligible]]
+        flagged = eligible[flags[eligible]]
+        if trusted.numel() >= k:
+            order = torch.argsort(residual_cost[trusted], stable=True)
+            candidates = trusted[order[: min(candidate_count, trusted.numel())]]
+        else:
+            forced_trusted = trusted
+            needed = k - trusted.numel()
+            order = torch.argsort(residual_cost[flagged], stable=True)
+            candidates = flagged[order[: min(
+                max(int(round(candidate_expansion_factor * needed)), needed),
+                flagged.numel(),
+            )]]
+        if selection_stats is not None:
+            selection_stats["forced_flagged"] = max(k - trusted.numel(), 0)
+            selection_stats["flagged_eligible"] = flagged.numel()
+            selection_stats["trusted_eligible"] = trusted.numel()
+            selection_stats["candidate_blocks"] = candidates.numel() + (
+                forced_trusted.numel()
+            )
+    remaining = k - forced_trusted.numel()
     relevance = query_relevance.detach().to(
         device=candidates.device, dtype=torch.float32
     )
@@ -506,13 +567,13 @@ def select_evicted_r2r(
     )
     ranked_candidates = candidates[relevance_order]
     if similarity is None and cover_cost is None:
-        chosen = ranked_candidates[:k].to(device="cpu")
+        chosen = ranked_candidates[:remaining].to(device="cpu")
         if selection_stats is not None:
-            selection_stats["unguarded"] = k
+            selection_stats["unguarded"] = remaining
     elif cover_depth == 0:
-        chosen = ranked_candidates[:k].to(device="cpu")
+        chosen = ranked_candidates[:remaining].to(device="cpu")
         if selection_stats is not None:
-            selection_stats["unguarded"] = k
+            selection_stats["unguarded"] = remaining
     else:
         cover_matrix = cover_cost if cover_cost is not None else similarity
         assert cover_matrix is not None
@@ -546,7 +607,7 @@ def select_evicted_r2r(
         decision_rows = decision_table.tolist()
 
         chosen_list: list[int] = []
-        chosen_set: set[int] = set()
+        chosen_set: set[int] = set(forced_trusted.tolist())
         for cover_rank in range(depth):
             for decision in decision_rows:
                 candidate = decision[0]
@@ -558,12 +619,12 @@ def select_evicted_r2r(
                     if selection_stats is not None:
                         key = f"cover_{cover_rank + 1}"
                         selection_stats[key] = selection_stats.get(key, 0) + 1
-                    if len(chosen_list) == k:
+                    if len(chosen_list) == remaining:
                         break
-            if len(chosen_list) == k:
+            if len(chosen_list) == remaining:
                 break
         # Final unguarded pass preserves exact matched memory.
-        if len(chosen_list) < k:
+        if len(chosen_list) < remaining:
             for decision in decision_rows:
                 candidate = decision[0]
                 if candidate not in chosen_set:
@@ -573,10 +634,11 @@ def select_evicted_r2r(
                         selection_stats["backfill"] = (
                             selection_stats.get("backfill", 0) + 1
                         )
-                    if len(chosen_list) == k:
+                    if len(chosen_list) == remaining:
                         break
         chosen = torch.tensor(chosen_list, dtype=torch.long, device="cpu")
     evict[chosen] = True
+    evict[forced_trusted.to(device="cpu")] = True
     return evict
 
 
@@ -795,6 +857,9 @@ class EvictionPolicy:
         # Per-fire global similarity matrix for coverage or R2R cover selection.
         self._coverage_similarity: torch.Tensor | None = None
         self._r2r_cover_cost: torch.Tensor | None = None
+        self._r2r_flagged: torch.Tensor | None = None
+        self._r2r_prompt_floor: dict[int, torch.Tensor] = {}
+        self._r2r_floor_pending: dict[int, torch.Tensor] = {}
         # Per-layer value rows retained only until traced R2R selection.
         self._r2r_metric_values: list[tuple[torch.Tensor, torch.Tensor]] = []
         # Raw causal QK attention mass for hard relevance protection. It remains
@@ -859,11 +924,17 @@ class EvictionPolicy:
         self._incremental_generation_np[req_index] += 1
         self._incremental_states.pop(req_index, None)
         self._incremental_pending_masks.pop(req_index, None)
+        self._r2r_prompt_floor.pop(req_index, None)
+        self._r2r_floor_pending.pop(req_index, None)
 
     def _stage_incremental_eviction(
         self, req_index: int, eviction_mask: torch.Tensor
     ) -> None:
         """Remember the old-row mask until its physical compaction lands."""
+        if self.config.r2r_persistent_floor:
+            self._r2r_floor_pending[req_index] = eviction_mask.detach().to(
+                device="cpu", dtype=torch.bool
+            ).clone()
         if not self.config.incremental_decode_scoring:
             return
         self._incremental_pending_masks[req_index] = (
@@ -878,6 +949,16 @@ class EvictionPolicy:
         invalidated conservatively; it is never guessed from reusable physical
         block ids.
         """
+        floor_mask = self._r2r_floor_pending.pop(req_index, None)
+        if floor_mask is not None:
+            old_floor = self._r2r_prompt_floor.get(req_index)
+            if old_floor is not None:
+                if old_floor.numel() != floor_mask.numel():
+                    raise RuntimeError("R2R floor compaction mask length mismatch")
+                survivors = old_floor[~floor_mask]
+                if survivors.numel() != survivor_count:
+                    raise RuntimeError("R2R floor survivor count mismatch")
+                self._r2r_prompt_floor[req_index] = survivors
         if not self.config.incremental_decode_scoring:
             return
         generation = int(self._incremental_generation_np[req_index]) + 1
@@ -989,6 +1070,7 @@ class EvictionPolicy:
         cfg = self.config
         self._coverage_similarity = None
         self._r2r_cover_cost = None
+        self._r2r_flagged = None
         self._r2r_metric_values.clear()
         self._query_relevance = None
         value_l2 = cfg.eviction_policy == "value_l2"
@@ -1012,6 +1094,7 @@ class EvictionPolicy:
         per_layer_query: list[torch.Tensor] = []  # populated when available
         per_layer_similarity: list[torch.Tensor] = []
         per_layer_cover_cost: list[torch.Tensor] = []
+        per_layer_dispersion: list[torch.Tensor] = []
         query_window_len: int | None = None
         scored_layer_idxs: list[int] = []  # global layer idx per per_layer row
         prof = self.profiler
@@ -1081,6 +1164,10 @@ class EvictionPolicy:
             valid = block_valid_lens(valid_len, c, self.block_size, self.device)
             if r2r_mode and prof.enabled:
                 self._r2r_metric_values.append((v, valid))
+            if r2r_mode and cfg.r2r_dispersion_kappa is not None:
+                per_layer_dispersion.append(
+                    block_value_outlier_ratio(v, valid).amax(dim=1)
+                )
             if value_l2:
                 # Paged-Eviction baseline: drop lowest value-L2-norm blocks.
                 # Negate so higher == more droppable, matching the scored-policy
@@ -1237,6 +1324,10 @@ class EvictionPolicy:
                 # Keep candidate scores and guard covers consistent: choose the
                 # cheapest cover only after aggregating its cost across layers.
                 scores = self._r2r_cover_cost.amin(dim=1)
+            if per_layer_dispersion:
+                assert cfg.r2r_dispersion_kappa is not None
+                spread = torch.stack(per_layer_dispersion, dim=0).median(dim=0)
+                self._r2r_flagged = spread.values > cfg.r2r_dispersion_kappa
         if (
             cfg.query_relevance_protect_quantile is not None
             and query_relevance is None
@@ -1387,6 +1478,7 @@ class EvictionPolicy:
         value_norm: torch.Tensor | None,
         *,
         record_r2r_stats: bool = True,
+        req_index: int | None = None,
     ) -> torch.Tensor:
         """Dispatch a budget cut to pairwise ranking or global coverage."""
         cfg = self.config
@@ -1395,6 +1487,20 @@ class EvictionPolicy:
             if relevance is None:
                 raise RuntimeError("R2R selection missing query relevance")
             fire_stats: dict[str, int] = {}
+            protected = None
+            if cfg.r2r_persistent_floor:
+                if req_index is None or req_index not in self._r2r_prompt_floor:
+                    raise RuntimeError("R2R prompt floor is not initialized")
+                protected = self._r2r_prompt_floor[req_index]
+                if protected.numel() < count:
+                    padding = torch.zeros(
+                        count - protected.numel(), dtype=torch.bool
+                    )
+                    protected = torch.cat(
+                        (protected, padding)
+                    )
+                if protected.numel() != count:
+                    raise RuntimeError("R2R prompt floor length exceeds cache")
             mask = select_evicted_r2r(
                 scores,
                 relevance,
@@ -1406,6 +1512,8 @@ class EvictionPolicy:
                 cover_cost=self._r2r_cover_cost,
                 cover_depth=cfg.r2r_cover_depth,
                 selection_stats=fire_stats,
+                protected_blocks=protected,
+                flagged_blocks=self._r2r_flagged,
             )
             if record_r2r_stats:
                 candidate_blocks = fire_stats.pop("candidate_blocks", 0)
@@ -1510,6 +1618,11 @@ class EvictionPolicy:
         self, req_index: int, prompt_len: int, block_tables: Any
     ) -> list[int]:
         cfg = self.config
+        if cfg.r2r_persistent_floor:
+            count_now = self._prompt_block_count(req_index, block_tables)
+            self._r2r_prompt_floor[req_index] = prompt_tail_floor_mask(
+                prompt_len, self.block_size, cfg.query_tail_tokens, count_now
+            )
         # Decoupled fraction-of-prompt path (takes precedence over the coupled
         # budget path). ``count`` is this request's prompt block count P. Record
         # its independent decode band now, from a cheap block-count read, so
@@ -1555,6 +1668,7 @@ class EvictionPolicy:
                     keep,
                     vn,
                     record_r2r_stats=record_r2r_stats,
+                    req_index=req_index,
                 )
 
             with self.profiler.section("selection"):
@@ -1600,6 +1714,7 @@ class EvictionPolicy:
                     low,
                     vn,
                     record_r2r_stats=record_r2r_stats,
+                    req_index=req_index,
                 )
         else:
 
@@ -1779,7 +1894,9 @@ class EvictionPolicy:
             # the full eviction set. Set the mask (hides blocks for the one-step
             # window) and report the indices for compaction.
             with self.profiler.section("selection"):
-                mask = self._select_budget_mask(scores, count, budget, vnorm)
+                mask = self._select_budget_mask(
+                    scores, count, budget, vnorm, req_index=req_index
+                )
             if not bool(mask.any()):
                 return []
             self._reset_r2r_query_window(req_index, mask)

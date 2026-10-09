@@ -1,0 +1,173 @@
+# R2R v2: implementation decisions
+
+Status: floor and dispersion phase implemented as opt-in flags; token-max and
+incremental pair-cost caching remain deferred. This resolves the open choices in
+the revised v2 proposal against the current `fix/geo-kv` selector. The existing
+v1 experiments remain the control. In particular, these choices do not claim
+that a protective change cannot reduce accuracy: a fixed budget means every
+newly protected block displaces some other block.
+
+## 1. Persistent floor: protect the prompt, plus the live decode anchor
+
+Use the existing `warmup_pages` sink count (one in the current sweeps). Add a
+request-local, immutable set of **logical prompt block identities** covering
+the last `query_tail_tokens` prompt tokens. For prompt length `P` and block
+size `s`, the pinned set is the blocks intersecting
+`[max(0, P - query_tail_tokens), P)`. At `s=16` and a 32-token window this is
+two blocks when aligned and can be three when unaligned. It is not a
+budget-dependent fraction or a measured question length.
+
+Derive the logical indices from known prompt length at request setup. During
+prefill, protect each pinned block as soon as it is materialized, including
+when admission/eviction occurs before prefill completes. Keep the set after
+prefill; do not redefine it from the current last block. Translate these
+logical identities to current physical block positions after every compaction,
+or store stable IDs in the block table. A request with no prefill eviction
+still initializes this state. Clear it on request teardown/reuse.
+
+Keep the selector's existing **current final block** protection as a separate
+decode/write anchor. The complete exclusion set is thus sink blocks, pinned
+prompt-tail blocks, and the current final block. Deduplicate overlaps. If a
+requested budget is smaller than this floor, fail configuration/admission
+explicitly rather than silently evicting protected blocks or exceeding the
+budget. Retain protected blocks as possible *covers* for other blocks; they
+are excluded only as eviction candidates.
+
+Why: the moving final block alone ceases to protect the prompt's question once
+decode appends blocks. The pinned set follows prompt content through physical
+compaction, while the live final block preserves the existing decode invariant.
+
+## 2. Dispersion: a conservative, self-relative guard
+
+For each eligible block, sampled layer, and KV head, compute the value anchor
+`v_bar = mean_t V_t` and distances `a_t = ||V_t - v_bar||_2` over **valid**
+tokens. Define
+
+```
+rho = max_t(a_t) / max(median_t(a_t), eps_scale)
+eps_scale = float32_machine_epsilon * max_t(||V_t||_2)
+```
+
+If both numerator and denominator are zero, define `rho = 1`. Use a
+predeclared default `kappa = 2`: flag a block when the median across sampled
+layers of the maximum head-wise `rho` is greater than 2. The median-layer
+quorum avoids treating one anomalous layer as a certain needle, while the
+head-wise maximum respects that eviction affects every KV head. Keep this
+aggregation configurable for an ablation; do not tune it on LongBench scores.
+
+Use median *distance*, not MAD of distances, as the denominator. MAD measures
+how tightly the distances cluster around each other, not their typical size;
+in high dimension it can approach zero for ordinary blocks and flag almost
+everything. The proposed ratio is deliberately simple, but `kappa=2` is a
+heuristic, not a statistical guarantee or a universal calibration. Inspect
+flag rates by task, model, budget, layer, and head before interpreting it as
+needle detection. A block with only one valid token is unflagged: it has no
+within-block evidence of an outlier.
+
+The guard is a **priority**, not an absolute prohibition. Let `T` be trusted
+eligible blocks and `G` flagged eligible blocks; `b` is the exact number that
+must be evicted.
+
+- If `|T| >= b`, form the Stage-1 shortlist only from `T`, taking the lowest
+  residual-cost `min(n*b, |T|)` blocks. Never add flagged blocks merely to
+  fill the `n*b` expansion target.
+- If `|T| < b`, every trusted block must be evicted. Choose the remaining
+  `b - |T|` from flagged blocks using the normal R2R ranking and cover guard.
+  The flagged shortlist may be expanded to `min(n*(b-|T|), |G|)`, but final
+  selection must respect the two separate quotas. Log the forced-flagged
+  count. If `|T| + |G| < b`, fail the capacity operation explicitly.
+
+For Stage 1, keep the production **directional, worst-head projection
+residual** and its sampled-layer aggregation, rather than replacing it with
+plain cosine. Keep stable tie-breaking by logical block order. Compute
+anchors for protected blocks too, since they may cover eligible blocks.
+
+## 3. Relevance: preserve v1 now; test token-max separately
+
+The cheap v1 relevance is the maximum query/key-anchor dot product over the
+captured query tail and query heads, not `mean(W) dot K_anchor`. Preserve that
+behavior in the first v2 quality run. The query buffer is fixed-size and
+rolling; its reset after eviction is unchanged.
+
+Do **not** enable boundary-only token-max in the same run as the floor and
+dispersion changes. It needs a separate GPU timing and ranking audit first:
+
+1. Implement a microbenchmark that computes valid-token, causal, GQA-aware
+   `max_{q,t}(q dot K_t) * qk_scale` from retained Q/K tensors at several
+   budgets and eviction sizes. Attention logits are not already retained by
+   the forward pass, so this is real work and memory traffic.
+2. Compare full-candidate token-max ranks with cheap ranks offline on sampled
+   eviction events. Measure how often a block **outside** a proposed boundary
+   would cross the final keep/evict decision. An inside-band flip counter alone
+   cannot detect this miss.
+3. Only if the audit shows an acceptable miss rate and cost, test a bounded
+   boundary implementation as its own quality ablation. Choose the band size
+   from the observed *last examined cheap rank* of the cover guard, not its
+   cover-1/cover-2/backfill counts. Use a cold-start fixed cap and report band
+   saturation during large prefill evictions.
+
+If a boundary variant is tested, rerank **within the band only** and retain
+the cheap order outside it. Do not sort a mixture of cheap and token-max
+numeric scores: max over tokens is systematically on another scale from a
+mean-pooled key score. A band around the raw `b`-th candidate is not a
+correctness guarantee: a hidden needle can be ranked arbitrarily far away by
+the cheap score. The out-of-band audit decides whether this approximation is
+worth running; if not, benchmark another bounded design or full-candidate
+token-max rather than claiming the boundary catches all needles.
+
+## 4. Incremental pair costs: defer until scoring is stable
+
+Do not adapt the current `IncrementalRedundancyState` cosine cache as a
+drop-in. R2R's pair cost is directional, per-head residual with a worst-head
+reduction. A future cache must key entries by stable block identity, layer,
+and content generation; update a partially filled block; delete evicted
+blocks; consider each new block as a possible better cover for **every**
+survivor; and preserve deterministic tie-breaking. Physical compaction alone
+must not invalidate unchanged logical pairs.
+
+Require tests comparing full and incremental pair-cost matrices, covers, and
+final eviction sets across append, partial-block growth, eviction,
+compaction, and request reset. Include the case where a new block supersedes
+an existing cover without any eviction. Numerical tolerance is appropriate
+for floating-point costs; final selected IDs should match exactly under
+stable tie-breaking. Treat this as a separate performance pass, not part of
+the first quality run. `O(deltaB * B)` is a target for new-pair computation,
+not an end-to-end complexity guarantee for cover updates or bookkeeping.
+
+## Validation and rollout
+
+1. Add CPU/selector tests for misaligned prompt tails, prefill eviction before
+   prompt end, decode growth, physical compaction, exact budget, protected
+   covers, and no-eligible-block behavior. Add synthetic dispersion tests for
+   homogeneous blocks, one-token outliers, zero/near-zero spread, partial
+   blocks, and multi-head/layer aggregation. Test strict trusted-first quotas.
+2. Run matched **floor-only**, **dispersion-only**, and **combined** ablations
+   against the unchanged v1 control before the full matrix. The combined
+   result alone cannot attribute a gain or regression. Record exact paired
+   prompts, seeds, accuracy, TTFT, TPOT, throughput, and GPU memory at budgets
+   16/32/64/128/256; report variability across repeated runs.
+3. Record floor size and overlaps, trusted/flagged eligible counts, forced
+   flagged evictions, cover-1/cover-2/backfill decisions, last examined rank,
+   and selector time. These are diagnostics, not additional tuning targets.
+4. Run the token-max microbenchmark/rank audit independently. Only then
+   decide whether its next quality ablation is boundary-only or full-pool.
+5. Redesign incremental pair maintenance after the scoring policy is fixed,
+   with parity tests and a separate performance comparison.
+
+This order deliberately rejects the revised proposal's claim that floor plus
+dispersion can only help or no-op. Both alter which other blocks survive at a
+fixed budget; either can hurt accuracy. It also keeps the 75%-to-100% prefill
+watermark question outside R2R scoring. Change that policy only in a separate
+experiment with an explicit control.
+
+## Current-code anchors
+
+- `vllm/v1/geo_kv/eviction_policy.py`: `select_evicted_r2r` and capacity paths.
+- `vllm/v1/geo_kv/scoring.py`: `block_pair_residual_cost` and
+  `block_key_anchor_relevance`.
+- `vllm/v1/geo_kv/config.py`: `warmup_pages`, `query_tail_tokens`, and existing
+  optional fractional tail protection.
+- `vllm/v1/geo_kv/incremental_scorer.py`: current cosine-only incremental
+  state, not an R2R pair-cost cache.
+- `analysis/r2r_algorithm.md`: original R2R description; this document
+  records proposed v2 decisions without changing that baseline.
