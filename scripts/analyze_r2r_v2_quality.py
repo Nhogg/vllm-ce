@@ -21,12 +21,21 @@ MODEL_TAGS = {
     "Llama-3.2-3B-Instruct": "3b",
     "Llama-3.1-8B-Instruct": "8b",
 }
+EXPECTED_LAYERS = {
+    "Llama-3.2-1B-Instruct": "2,6,10,14",
+    "Llama-3.2-3B-Instruct": "3,10,17,24",
+    "Llama-3.1-8B-Instruct": "3,11,20,28",
+}
 TASKS = {
     "qasper": "Qasper",
     "gov_report": "GovReport",
     "multi_news": "MultiNews",
     "hotpotqa": "HotpotQA",
     "multifieldqa_en": "MultiFieldQA",
+}
+EXPECTED_METRICS = {
+    task: ("rouge_l" if task in ("gov_report", "multi_news") else "qa_f1")
+    for task in TASKS
 }
 CAPACITIES = (16, 32, 64, 128, 256)
 VARIANTS = ("v1", "v2")
@@ -46,6 +55,32 @@ def _finite(value: str | float | int, context: str) -> float:
     if not math.isfinite(parsed):
         raise ValueError(f"non-finite {context}: {value!r}")
     return parsed
+
+
+def _validate_protocol(row: dict[str, str], key: tuple[str, str, str, int]) -> None:
+    """Reject rows that do not match the submitted v2 sweep protocol."""
+    model, task, _, capacity = key
+    expected = {
+        "block_size": 16,
+        "budget_tokens": capacity * 16,
+        "watermark": 0.75,
+        "candidate_expansion_factor": 4.0,
+        "r2r_cover_depth": 2,
+        "query_tail_tokens": 32,
+    }
+    for field, value in expected.items():
+        if _finite(row[field], f"{key}/{field}") != value:
+            raise ValueError(f"unexpected {field} for {key}")
+    expected_text = {
+        "metric_name": EXPECTED_METRICS[task],
+        "score_sampled_layers": EXPECTED_LAYERS[model],
+        "r2r_query_aggregation": "max",
+        "r2r_relevance_signal": "key_anchor",
+        "block_prototype_mode": "mean",
+    }
+    for field, value in expected_text.items():
+        if row[field] != value:
+            raise ValueError(f"unexpected {field} for {key}")
 
 
 def load_matrix(
@@ -72,6 +107,9 @@ def load_matrix(
         cell = (str(base["model"]), str(base["task"]))
         if cell not in expected_cells or cell in baselines:
             raise ValueError(f"unexpected or duplicate model/task cell: {cell}")
+        expected_dir = f"r2r_v2_{MODEL_TAGS[cell[0]]}_{cell[1]}"
+        if cell_dir.name != expected_dir:
+            raise ValueError(f"wrong directory for model/task cell: {cell_dir}")
         baselines[cell] = base
         with csv_path.open(newline="") as handle:
             for row in csv.DictReader(handle):
@@ -92,6 +130,9 @@ def load_matrix(
                 kappa = row["r2r_dispersion_kappa"]
                 if expected_kappa != (kappa not in ("", "None")):
                     raise ValueError(f"dispersion setting inconsistent: {key}")
+                if expected_kappa and _finite(kappa, f"{key}/kappa") != 2.0:
+                    raise ValueError(f"unexpected dispersion kappa: {key}")
+                _validate_protocol(row, key)
                 for metric in METRICS:
                     _finite(row[metric], f"{key}/{metric}")
                 rows[key] = row
@@ -142,12 +183,90 @@ def paired_delta(
     )
 
 
-def paired_rows(root: Path, rows: dict, capacities: tuple[int, ...]) -> list[dict]:
+def _validate_raw_run(
+    run: dict,
+    arm: dict[str, str],
+    baseline: dict,
+    variant: str,
+    capacity: int,
+) -> None:
+    """Cross-check raw JSON provenance against its CSV row and baseline."""
+    cell = (arm["model"], arm["task"])
+    expected = {
+        "model": cell[0],
+        "task": cell[1],
+        "mode": "band",
+        "eviction_policy": "v_redundancy",
+        "metric_name": arm["metric_name"],
+        "score_sampled_layers": EXPECTED_LAYERS[cell[0]],
+        "r2r_query_aggregation": "max",
+        "r2r_relevance_signal": "key_anchor",
+        "r2r_persistent_floor": variant == "v2",
+    }
+    for field, value in expected.items():
+        if run.get(field) != value:
+            raise ValueError(f"raw {field} mismatch: {cell}/{variant}/{capacity}")
+    numeric = {
+        "capacity": capacity,
+        "block_size": 16,
+        "watermark": 0.75,
+        "candidate_expansion_factor": 4.0,
+        "r2r_cover_depth": 2,
+        "query_tail_tokens": 32,
+        "low_watermark_blocks": max(1, min(int(0.75 * capacity), capacity - 1)),
+    }
+    for field, value in numeric.items():
+        if _finite(run[field], f"raw {field}") != value:
+            raise ValueError(f"raw {field} mismatch: {cell}/{variant}/{capacity}")
+    kappa = run.get("r2r_dispersion_kappa")
+    if variant == "v2" and kappa != 2.0:
+        raise ValueError(f"raw dispersion kappa mismatch: {cell}/{capacity}")
+    if variant == "v1" and kappa is not None:
+        raise ValueError(f"raw v1 dispersion enabled: {cell}/{capacity}")
+    ids = run["prompt_ids"]
+    base_ids = baseline["prompt_ids"]
+    if (
+        len(ids) != len(set(ids))
+        or len(base_ids) != len(set(base_ids))
+        or set(ids) != set(base_ids)
+        or len(ids) != int(run["num_prompts"])
+        or len(ids) != int(arm["n"])
+    ):
+        raise ValueError(f"raw/baseline prompt IDs mismatch: {cell}/{capacity}")
+    for field in (
+        "qa_f1",
+        "throughput_tok_s",
+        "mean_ttft_ms",
+        "mean_tpot_ms",
+        "steady_blocks",
+    ):
+        if (
+            abs(
+                _finite(run[field], f"raw {field}")
+                - _finite(arm[field], f"CSV {field}")
+            )
+            > 0.0001
+        ):
+            raise ValueError(f"CSV/raw {field} mismatch: {cell}/{capacity}")
+
+
+def paired_rows(
+    root: Path, rows: dict, baselines: dict, capacities: tuple[int, ...]
+) -> list[dict]:
     """Build v2-v1 accuracy and efficiency comparisons from raw run JSONs."""
     comparisons = []
     for model, task in sorted({key[:2] for key in rows}):
         cell_dir = root / f"r2r_v2_{MODEL_TAGS[model]}_{task}"
         stem = cell_dir.name
+        baseline = baselines[(model, task)]
+        if (
+            baseline.get("mode") != "baseline"
+            or baseline.get("eviction_policy") != "none"
+            or baseline.get("block_size") != 16
+            or baseline.get("metric_name") != EXPECTED_METRICS[task]
+            or baseline.get("num_prompts") != len(baseline["prompt_ids"])
+        ):
+            raise ValueError(f"invalid baseline provenance: {model}/{task}")
         for capacity in capacities:
             arm1 = rows[(model, task, "v1", capacity)]
             arm2 = rows[(model, task, "v2", capacity)]
@@ -174,10 +293,8 @@ def paired_rows(root: Path, rows: dict, capacities: tuple[int, ...]) -> list[dic
                 run1 = json.load(handle)
             with run_paths[1].open() as handle:
                 run2 = json.load(handle)
-            if (run1["model"], run1["task"]) != (model, task):
-                raise ValueError(f"v1 raw run mismatch: {run_paths[0]}")
-            if (run2["model"], run2["task"]) != (model, task):
-                raise ValueError(f"v2 raw run mismatch: {run_paths[1]}")
+            _validate_raw_run(run1, arm1, baseline, "v1", capacity)
+            _validate_raw_run(run2, arm2, baseline, "v2", capacity)
             n, delta, low, high = paired_delta(run1, run2)
             if n != int(arm1["n"]) or n != int(arm2["n"]):
                 raise ValueError(f"prompt count mismatch: {model}/{task}/{capacity}")
@@ -342,9 +459,22 @@ def main() -> None:
     parser.add_argument(
         "--root", type=Path, default=Path("results/r2r_v2_quality_matrix")
     )
+    parser.add_argument(
+        "--check-only",
+        action="store_true",
+        help="Validate the complete grid and raw provenance without writing files.",
+    )
     args = parser.parse_args()
     rows, baselines = load_matrix(args.root)
-    comparisons = paired_rows(args.root, rows, CAPACITIES)
+    comparisons = paired_rows(args.root, rows, baselines, CAPACITIES)
+    if args.check_only:
+        print(
+            f"PASS: {len(baselines)} model/task cells, {len(rows)} arms, "
+            f"{len(comparisons)} prompt-paired v2/v1 comparisons; "
+            "recorded protocol matches 16/32/64/128/256 blocks, κ=2, "
+            "key_anchor relevance, and the submitted layer subsets."
+        )
+        return
     charts = args.root / "charts"
     charts.mkdir(parents=True, exist_ok=True)
     with (charts / "paired_v2_vs_v1.csv").open("w", newline="") as handle:

@@ -1,9 +1,9 @@
 # R2R v2: implementation decisions
 
 Status: floor and dispersion phase implemented as opt-in flags. Standalone
-token-max timing and opt-in full-vs-boundary rank diagnostics exist, but
-token-max is not wired into the applied eviction decision. Incremental
-pair-cost caching remains deferred. This resolves the open choices in the
+token-max timing and opt-in full-vs-boundary rank diagnostics have completed
+their first small GPU probe; token-max is still not wired into the applied
+eviction decision. Incremental pair-cost caching remains deferred. This resolves the open choices in the
 revised v2 proposal against the current `fix/geo-kv` selector. The existing
 v1 experiments remain the control. In particular, these choices do not claim
 that a protective change cannot reduce accuracy: a fixed budget means every
@@ -161,6 +161,41 @@ dispersion can only help or no-op. Both alter which other blocks survive at a
 fixed budget; either can hurt accuracy. It also keeps the 75%-to-100% prefill
 watermark question outside R2R scoring. Change that policy only in a separate
 experiment with an explicit control.
+
+## First token-max gate result (2026-10-12)
+
+The one-GPU synthetic probe used an A100 40 GB, a 32-query window, 16-token
+blocks, and the 3B audit model's 24 query heads / 8 KV heads / 128 head
+dimension. At 16/64/256 blocks, median cheap-key-anchor time was
+0.293/0.292/0.295 ms per scorer call; full-pool token-max was
+0.333/0.331/0.335 ms. Quarter-pool bounded bands were
+0.361/0.360/0.371 ms, including candidate gathers. Bands saved temporary
+memory but were not faster at these sizes. These isolated timings are not
+end-to-end TTFT/TPOT measurements.
+
+The first live rank audit used 10 `multifieldqa_en` prompts on the 3B model,
+with κ=2 and 10 prefill eviction fires. Full-pool token-max changed the cheap
+selector on all 10 fires (15.1 selected-block swaps on average). Boundary
+bands with margins 4/8/16/32 matched the full selection on **0/10** fires;
+every fire had at least one newly full-selected block outside each band. The
+widest margin still missed 8.0 selected blocks on average. The profiler also
+recorded candidate coverage 1608/1982 (81.1%) and only 6 flagged eligible
+blocks, with no forced flagged evictions, in this sample.
+
+**Decision:** do not enable the proposed boundary-only token-max relevance.
+Its approximation missed on every sampled fire and did not win synthetic
+latency. This is one model/task and 10 prompts, not a general accuracy result:
+we do not yet know whether full-pool token-max improves LongBench scores.
+After the floor+dispersion quality sweep finishes, the next candidate is a
+separate full-pool token-max quality/performance ablation against that v2
+control, not an unqualified claim that token-max is better. Keep the
+directional pair-cost cache redesign deferred until selection logic settles.
+The concrete follow-up design is in `analysis/r2r_v2_full_pool_token_max_plan.md`.
+
+Artifacts: `results/r2r_v2/token_max_microbench.json` and
+`results/r2r_v2/rank_audit/summary.json`. The rank summary is generated from
+`audit.json.scorer_profile.json` by
+`benchmarks/analyze_r2r_rank_audit.py`.
 
 ## Current-code anchors
 
