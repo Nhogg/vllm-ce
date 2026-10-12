@@ -14,9 +14,11 @@ import torch
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
 from vllm.v1.geo_kv.config import GeoKVConfig, resolve_indices
+from vllm.v1.geo_kv.scorer_profiler import ScorerProfiler
 from vllm.v1.geo_kv.eviction_policy import (
     EvictionPolicy,
     aggregate_layer_scores,
+    boundary_token_max_ranks,
     prompt_tail_floor_mask,
     select_evicted_blocks,
     select_evicted_by_coverage,
@@ -234,6 +236,7 @@ def test_query_relevance_refinement_is_inert_weighted_and_tie_only():
 def test_r2r_selects_least_relevant_from_redundancy_shortlist():
     scores = torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 9.0])
     relevance = torch.tensor([0.9, 0.8, 0.1, 0.2, 0.0, 0.3, 0.4, 1.0])
+    ranked: list[int] = []
 
     mask = select_evicted_r2r(
         scores,
@@ -242,9 +245,11 @@ def test_r2r_selects_least_relevant_from_redundancy_shortlist():
         budget=6,
         warmup_pages=0,
         candidate_expansion_factor=2.0,
+        ranked_candidates_out=ranked,
     )
 
     assert torch.nonzero(mask).flatten().tolist() == [2, 3]
+    assert ranked == [2, 3, 1, 0]
 
 
 def test_r2r_v2_protected_floor_and_trusted_priority():
@@ -317,6 +322,42 @@ def test_r2r_v2_token_max_respects_causal_mask_and_gqa():
         scale=1.0,
     )
     assert relevance.tolist() == [10.0, 10.0]
+
+
+def test_r2r_v2_boundary_rerank_keeps_outside_order():
+    token_max = torch.tensor([0.0, 50.0, 10.0, 20.0, 0.0])
+    ranks = boundary_token_max_ranks([0, 1, 2, 3, 4], token_max, 2, 1)
+    assert ranks.tolist() == [0.0, 2.0, 1.0, 3.0, 4.0]
+    assert boundary_token_max_ranks(
+        [0, 1, 2, 3, 4], token_max, 2, 0
+    ).tolist() == [0.0, 1.0, 2.0, 3.0, 4.0]
+
+
+def test_r2r_v2_rank_audit_does_not_change_applied_mask():
+    policy = object.__new__(EvictionPolicy)
+    policy.config = GeoKVConfig(
+        candidate_expansion_factor=2.0,
+        r2r_token_max_audit=True,
+        enable_tracing=True,
+    )
+    policy._query_relevance = torch.tensor([0.0, 1.0, 2.0, 3.0, 9.0])
+    policy._r2r_token_max = torch.tensor([3.0, 2.0, 1.0, 0.0, 9.0])
+    policy._r2r_cover_cost = None
+    policy._r2r_flagged = None
+    policy._r2r_metric_values = []
+    policy._r2r_candidate_blocks = 0
+    policy._r2r_eligible_blocks = 0
+    policy._r2r_selection_fires = 0
+    policy._r2r_selection_counts = {}
+    policy.profiler = ScorerProfiler(enabled=True, device=torch.device("cpu"))
+    mask = policy._select_budget_mask(
+        torch.arange(5, dtype=torch.float32), 5, 3, None
+    )
+    assert torch.nonzero(mask).flatten().tolist() == [0, 1]
+    audit = policy.profiler.summary()["r2r_rank_audits"][0]
+    assert audit["full_vs_applied_blocks"] == 4
+    assert audit["bands"]["0"]["different_blocks"] == 4
+    assert audit["bands"]["4"]["different_blocks"] == 0
 
 
 def test_r2r_v2_forced_flagged_fallback_keeps_exact_budget():

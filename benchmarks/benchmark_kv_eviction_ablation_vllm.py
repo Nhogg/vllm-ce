@@ -236,11 +236,28 @@ def _confidence_prompt(tokenizer: Any, prompt: dict, answer: str) -> list[int]:
         "percent sign or explanation.\n\n"
         f"ORIGINAL TASK:\n{task_text}\n\nPROPOSED ANSWER:\n{answer}"
     )
-    return tokenizer.apply_chat_template(
+    encoded = tokenizer.apply_chat_template(
         [{"role": "user", "content": content}],
         tokenize=True,
         add_generation_prompt=True,
     )
+    # Recent Transformers releases may return a BatchEncoding here even when
+    # tokenize=True. Iterating that object yields field names ("input_ids",
+    # "attention_mask"), which are not token IDs.
+    if not isinstance(encoded, list):
+        try:
+            encoded = encoded["input_ids"]
+        except (KeyError, TypeError) as exc:
+            raise TypeError(
+                "chat template did not return token IDs or an input_ids field"
+            ) from exc
+    if encoded and isinstance(encoded[0], list):
+        if len(encoded) != 1:
+            raise TypeError("chat template unexpectedly returned a token batch")
+        encoded = encoded[0]
+    if not all(isinstance(token_id, int) for token_id in encoded):
+        raise TypeError("chat template returned non-integer token IDs")
+    return encoded
 
 
 def _max_repetition_run(text: str) -> int:
@@ -331,6 +348,15 @@ def _geo_config(args) -> dict[str, Any] | None:
                 "r2r_cover_depth": args.r2r_cover_depth,
                 "r2r_query_aggregation": args.r2r_query_aggregation,
                 "r2r_relevance_signal": args.r2r_relevance_signal,
+                "r2r_persistent_floor": getattr(
+                    args, "r2r_persistent_floor", False
+                ),
+                "r2r_dispersion_kappa": getattr(
+                    args, "r2r_dispersion_kappa", None
+                ),
+                "r2r_token_max_audit": getattr(
+                    args, "r2r_token_max_audit", False
+                ),
                 "enable_tracing": True,
                 "log_path": args.dump_json,
             }
@@ -701,6 +727,21 @@ def _spawn(
         r2r_query_aggregation,
         "--r2r-relevance-signal",
         r2r_relevance_signal,
+        *(
+            ["--r2r-persistent-floor"]
+            if getattr(args, "r2r_persistent_floor", False)
+            else []
+        ),
+        *(
+            ["--r2r-dispersion-kappa", str(args.r2r_dispersion_kappa)]
+            if getattr(args, "r2r_dispersion_kappa", None) is not None
+            else []
+        ),
+        *(
+            ["--r2r-token-max-audit"]
+            if getattr(args, "r2r_token_max_audit", False)
+            else []
+        ),
         *(
             ["--value-blend-beta", str(args.value_blend_beta)]
             if getattr(args, "value_blend_beta", None)
@@ -1418,6 +1459,9 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("key_anchor", "attention_mass"),
         default="key_anchor",
     )
+    p.add_argument("--r2r-token-max-audit", action="store_true")
+    p.add_argument("--r2r-persistent-floor", action="store_true")
+    p.add_argument("--r2r-dispersion-kappa", type=float, default=None)
     p.add_argument("--dump-json", default=None)
     return p
 
