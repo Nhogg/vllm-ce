@@ -1,0 +1,15 @@
+#!/bin/bash
+#PBS -N geo_r2r_v2_ablation
+#PBS -l filesystems=home:eagle
+#PBS -l select=1:ngpus=8:ncpus=256:mem=960gb
+#PBS -l place=scatter:excl
+#PBS -l walltime=24:00:00
+#PBS -q by-node
+#PBS -A datascience_collab
+#PBS -r y
+
+# Matched factorial ablation: v1, floor-only, dispersion-only, combined v2.
+# Reuse the validated one-job/two-wave cell driver without changing its source.
+export GEO_OUTPUT_ROOT="${GEO_OUTPUT_ROOT:-results/r2r_v2_ablation_matrix}"
+export GEO_R2R_VARIANTS=v1,floor,dispersion,v2
+source /home/nhogg/vllm-ce/benchmarks/geo_r2r_v2_quality_matrix.pbs

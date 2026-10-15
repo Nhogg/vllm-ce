@@ -197,6 +197,41 @@ Artifacts: `results/r2r_v2/token_max_microbench.json` and
 `audit.json.scorer_profile.json` by
 `benchmarks/analyze_r2r_rank_audit.py`.
 
+## Full v1 vs combined-v2 quality result (2026-10-14)
+
+PBS job `196082` exited zero. The validator accepted all 15 model/task cells,
+150 arms, and 75 prompt-paired comparisons at 16/32/64/128/256 blocks. Each
+task used 200 prompts except `multifieldqa_en` (150). The 0.75 watermark,
+κ=2, key-anchor relevance, and sampled layers matched the submitted protocol.
+The source checksum snapshot still matched after completion. Figures and the
+paired CSV are in `results/r2r_v2_quality_matrix/charts/`.
+
+Across the 75 comparisons, combined v2 beat v1 in 40, lost in 25, and tied in
+10. This count is not a pooled task score: QA F1 and ROUGE-L have different
+meanings, and the five budgets within each model/task are not independent.
+Prompt-bootstrap 95% intervals excluded zero in 10 positive and eight
+negative comparisons; 57 crossed zero. They are not adjusted for the 75
+comparisons and do not measure run-to-run variability.
+
+The pattern is heterogeneous. HotpotQA improved in 10/15 comparisons (five
+positive intervals excluding zero), while Multi-News lost in 9/15 (six
+negative intervals excluding zero). The largest observed loss was 8B
+MultiFieldQA at 16 blocks: QA F1 delta −0.0849, paired 95% interval
+[−0.1301, −0.0422]. At 256 blocks, ten comparisons tied exactly, consistent
+with little or no eviction pressure in those cells. Do not claim a general v2
+win or infer which component caused an individual gain/loss from this combined
+comparison.
+
+Reported v2 TTFT was higher in 59/75 comparisons, with a mean cellwise delta
+of +147 ms; throughput and TPOT were mixed. These are single-run wall-clock
+measurements, not repeated-run estimates, so treat the magnitude cautiously.
+The next quality and overhead experiment should isolate **floor-only** and
+**dispersion-only** alongside v1 and combined v2 on matched prompts. A
+four-arm analyzer should report each arm minus v1 and the factorial
+interaction `v2 - floor - dispersion + v1`, including paired bootstrap
+intervals. Do not switch to boundary-only token-max based on this result;
+the earlier rank audit still argues against that shortcut.
+
 ## Current-code anchors
 
 - `vllm/v1/geo_kv/eviction_policy.py`: `select_evicted_r2r` and capacity paths.

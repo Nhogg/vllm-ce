@@ -201,7 +201,7 @@ def _validate_raw_run(
         "score_sampled_layers": EXPECTED_LAYERS[cell[0]],
         "r2r_query_aggregation": "max",
         "r2r_relevance_signal": "key_anchor",
-        "r2r_persistent_floor": variant == "v2",
+        "r2r_persistent_floor": variant in ("floor", "v2"),
     }
     for field, value in expected.items():
         if run.get(field) != value:
@@ -219,10 +219,10 @@ def _validate_raw_run(
         if _finite(run[field], f"raw {field}") != value:
             raise ValueError(f"raw {field} mismatch: {cell}/{variant}/{capacity}")
     kappa = run.get("r2r_dispersion_kappa")
-    if variant == "v2" and kappa != 2.0:
+    if variant in ("dispersion", "v2") and kappa != 2.0:
         raise ValueError(f"raw dispersion kappa mismatch: {cell}/{capacity}")
-    if variant == "v1" and kappa is not None:
-        raise ValueError(f"raw v1 dispersion enabled: {cell}/{capacity}")
+    if variant in ("v1", "floor") and kappa is not None:
+        raise ValueError(f"raw dispersion enabled: {cell}/{variant}/{capacity}")
     ids = run["prompt_ids"]
     base_ids = baseline["prompt_ids"]
     if (
